@@ -60,7 +60,7 @@ const TRAVEL_SECONDS = {
     'Switzerland': (2 * 60 + 55) * 60,
     'Japan': (3 * 60 + 45) * 60,
     'China': (4 * 60 + 2) * 60,
-    'United Arab Emirates': (4 * 60 + 31) * 60,
+    'UAE': (4 * 60 + 31) * 60,
     'South Africa': (4 * 60 + 57) * 60
   },
   standard_business: {
@@ -73,7 +73,7 @@ const TRAVEL_SECONDS = {
     'Switzerland': 53 * 60,
     'Japan': (1 * 60 + 8) * 60,
     'China': (1 * 60 + 12) * 60,
-    'United Arab Emirates': (1 * 60 + 21) * 60,
+    'UAE': (1 * 60 + 21) * 60,
     'South Africa': (1 * 60 + 29) * 60
   },
   airstrip: {
@@ -86,7 +86,7 @@ const TRAVEL_SECONDS = {
     'Switzerland': (2 * 60 + 3) * 60,
     'Japan': (2 * 60 + 38) * 60,
     'China': (2 * 60 + 49) * 60,
-    'United Arab Emirates': (3 * 60 + 10) * 60,
+    'UAE': (3 * 60 + 10) * 60,
     'South Africa': (3 * 60 + 28) * 60
   },
   private: {
@@ -99,7 +99,7 @@ const TRAVEL_SECONDS = {
     'Switzerland': (1 * 60 + 28) * 60,
     'Japan': (1 * 60 + 53) * 60,
     'China': (2 * 60 + 1) * 60,
-    'United Arab Emirates': (2 * 60 + 15) * 60,
+    'UAE': (2 * 60 + 15) * 60,
     'South Africa': (2 * 60 + 29) * 60
   }
 };
