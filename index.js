@@ -282,6 +282,9 @@ function estimateTravelWindow(type, dest, startedAtMs) {
   return { earliest, latest, ambiguous: false };
 }
 
+// Discord timestamp helper: style 't' = time, 'f' = date+time
+const ts = (unix, style = 'f') => `<t:${unix}:${style}>`;
+
 function buildStateEmbed({ userId, name, state, status, travel, titlePrefix = 'Status' }) {
   const color = STATE_COLORS[state] || 0x5865F2;
   const emoji = STATE_EMOJI[state] || 'ℹ️';
@@ -298,24 +301,25 @@ function buildStateEmbed({ userId, name, state, status, travel, titlePrefix = 'S
   if (status?.description) lines.push(`• ${status.description}`);
 
   // Travel block
-  if (state === 'Traveling') {
-    const dest = travel?.dest || parseDestination(status?.description);
-    const type = status?.travel_type || travel?.type || 'unknown';
-    const typePretty = type.replace(/_/g, ' ');
-    if (dest) lines.push(`• Destination: ${dest}`);
-    lines.push(`• Travel type: ${typePretty}`);
+  if (travel?.earliest && travel?.latest) {
+    const earliest = travel.earliest;
+    const latest = travel.latest;
+    const mid = Math.floor((earliest + latest) / 2);
+    const plusMinusMin = Math.max(1, Math.round((latest - earliest) / 120)); // half-window in minutes
 
-    if (travel?.earliest && travel?.latest) {
-      const e = `<t:${travel.earliest}:R>`;
-      const l = `<t:${travel.latest}:R>`;
-      if (travel.ambiguous) {
-        lines.push(`• ETA window: ${e} to ${l} (standard econ/business)`);
-      } else {
-        lines.push(`• ETA: ${e} to ${l} (±5%)`);
-      }
+    // Exact-looking center time, plus optional window
+    const center = ts(mid, 'f');         // absolute local date+time
+    const windowShort = `${ts(earliest, 't')}–${ts(latest, 't')}`; // times only
+
+    if (travel.ambiguous) {
+      lines.push(`• ETA: ${center} (±${plusMinusMin}m)`);
+      lines.push(`• Window: ${windowShort} (standard econ/business; ±5%)`);
     } else {
-      lines.push(`• ETA: unknown`);
+      lines.push(`• ETA: ${center} (±${plusMinusMin}m)`);
+      lines.push(`• Window: ${windowShort} (±5%)`);
     }
+  } else {
+    lines.push(`• ETA: unknown`);
   }
 
   // Jail/Hospital extra
