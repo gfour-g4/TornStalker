@@ -48,7 +48,7 @@ const STATE_COLORS = {
 
 const SELF_PING_MS = 12 * 60 * 1000;
 
-// Travel durations (seconds) — using 'UAE' as requested
+// Travel durations (seconds)
 const TRAVEL_SECONDS = {
   standard_economy: {
     'Mexico': 26 * 60,
@@ -105,6 +105,7 @@ const TRAVEL_SECONDS = {
 };
 
 const DEFAULT_STATES_LIST = parseStatesInput(DEFAULT_STATES || 'Traveling,Jail,Hospital');
+const STORE_PATH = path.resolve(PERSIST_PATH || './store.json');
 
 // ========= Env checks =========
 function assertEnv(name, value) {
@@ -116,29 +117,6 @@ function assertEnv(name, value) {
 assertEnv('DISCORD_TOKEN', DISCORD_TOKEN);
 assertEnv('OWNER_DISCORD_ID', OWNER_DISCORD_ID);
 assertEnv('TORN_API_KEY', TORN_API_KEY);
-
-// ========= Store path (writable) =========
-let STORE_PATH = path.resolve(PERSIST_PATH || './store.json');
-
-function ensureWritableStorePath(targetPath) {
-  const dir = path.dirname(targetPath);
-  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
-  try {
-    const probe = path.join(dir, `.rwtest-${Date.now()}`);
-    fs.writeFileSync(probe, 'ok');
-    fs.unlinkSync(probe);
-    return targetPath;
-  } catch (e) {
-    const fallback = path.resolve('/tmp/store.json');
-    console.warn(`[store] ${targetPath} not writable (${e.code || e.message}); using ${fallback}`);
-    try {
-      const fbDir = path.dirname(fallback);
-      fs.mkdirSync(fbDir, { recursive: true });
-    } catch {}
-    return fallback;
-  }
-}
-STORE_PATH = ensureWritableStorePath(STORE_PATH);
 
 // ========= Discord client + web server =========
 const client = new Client({
@@ -204,18 +182,12 @@ let store = {
 function loadStore() {
   try {
     if (fs.existsSync(STORE_PATH)) {
-      const raw = fs.readFileSync(STORE_PATH, 'utf8');
-      if (raw && raw.trim()) {
-        const json = JSON.parse(raw);
-        store = Object.assign(store, json);
-        if (!store.watchers || typeof store.watchers !== 'object') store.watchers = {};
-        if (!Number.isFinite(store.requestMs) || store.requestMs < 1000) store.requestMs = 5000;
-        console.log(`[store] Loaded from ${STORE_PATH}`);
-      } else {
-        console.log(`[store] Existing file empty at ${STORE_PATH}; starting fresh`);
-      }
+      store = Object.assign(store, JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')));
+      if (!store.watchers || typeof store.watchers !== 'object') store.watchers = {};
+      if (!Number.isFinite(store.requestMs) || store.requestMs < 1000) store.requestMs = 5000;
+      console.log(`[store] Loaded from ${STORE_PATH}`);
     } else {
-      console.log(`[store] No store at ${STORE_PATH}; will seed if env provided`);
+      console.log('[store] No store.json; will seed from env if available');
     }
   } catch (e) {
     console.warn('[store] Failed to load store:', e.message);
@@ -223,22 +195,15 @@ function loadStore() {
 }
 
 let saveTimer = null;
-function atomicWrite(filePath, data) {
-  const tmp = `${filePath}.tmp`;
-  fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, filePath);
-}
-function saveStoreNow(reason = '') {
-  try {
-    atomicWrite(STORE_PATH, JSON.stringify(store, null, 2));
-    console.log(`[store] Saved ${Object.keys(store.watchers).length} watcher(s) -> ${STORE_PATH}${reason ? ` (${reason})` : ''}`);
-  } catch (e) {
-    console.warn(`[store] Save failed: ${e.code || ''} ${e.message} (path: ${STORE_PATH})`);
-  }
-}
-function saveStoreDebounced(reason = '') {
+function saveStoreDebounced() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => saveStoreNow(reason), 250);
+  saveTimer = setTimeout(() => {
+    try {
+      fs.writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
+    } catch (e) {
+      console.warn('[store] Failed to save store:', e.message);
+    }
+  }, 250);
 }
 
 // ========= Helpers =========
@@ -252,32 +217,32 @@ function parseStatesInput(input) {
   if (invalid.length) throw new Error(`Invalid state(s): ${invalid.join(', ')}. Allowed: ${ALLOWED_STATES.join(', ')}`);
   return [...new Set(parts)];
 }
-function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase(); }
+function capitalize(s) {
+  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+}
+function inGuildEphemeral(interaction) {
+  return interaction.inGuild() ? { ephemeral: true } : {};
+}
 
-function inGuildEphemeral(interaction) { return interaction.inGuild(); }
-
-function profileUrl(userId) { return `https://www.torn.com/profiles.php?XID=${userId}`; }
+function profileUrl(userId) {
+  return `https://www.torn.com/profiles.php?XID=${userId}`;
+}
 
 function cleanDestName(s) {
   if (!s) return null;
   return s.replace(/[^\w\s-]/g, '').replace(/\s+/g, ' ').trim();
 }
-function allDestKeys() {
-  return [...new Set([
-    ...Object.keys(TRAVEL_SECONDS.standard_economy),
-    ...Object.keys(TRAVEL_SECONDS.standard_business),
-    ...Object.keys(TRAVEL_SECONDS.airstrip),
-    ...Object.keys(TRAVEL_SECONDS.private)
-  ])];
-}
+
 function parseDestination(description) {
   if (!description) return null;
   const text = description.trim();
+  // Try "from X" (returning) or "to X" (outbound)
   const fromMatch = text.match(/from\s+([A-Za-z\s-]+)$/i);
   const toMatch = text.match(/to\s+([A-Za-z\s-]+)$/i);
   const dest = cleanDestName((fromMatch && fromMatch[1]) || (toMatch && toMatch[1]) || '');
   if (!dest) return null;
-  const keys = allDestKeys();
+  // Canonicalize to mapping key capitalization
+  const keys = Object.keys(TRAVEL_SECONDS.airstrip);
   const found = keys.find(k => k.toLowerCase() === dest.toLowerCase());
   return found || dest;
 }
@@ -287,7 +252,10 @@ function estimateTravelWindow(type, dest, startedAtMs) {
   const pad = 0.05; // ±5%
   const startedAtSec = Math.floor(startedAtMs / 1000);
 
-  if (!dest) return { earliest: null, latest: null, ambiguous: false };
+  if (!dest) {
+    // Unknown destination -> no ETA
+    return { earliest: null, latest: null, ambiguous: false };
+  }
 
   const typeKey = (type || '').toLowerCase();
   if (typeKey === 'standard') {
@@ -301,7 +269,9 @@ function estimateTravelWindow(type, dest, startedAtMs) {
     return { earliest, latest, ambiguous: true };
   }
 
-  const mapKey = ['airstrip', 'private', 'standard_economy', 'standard_business'].includes(typeKey) ? typeKey : null;
+  const mapKey = ['airstrip', 'private', 'standard_economy', 'standard_business'].includes(typeKey)
+    ? typeKey
+    : null;
   if (!mapKey) return { earliest: null, latest: null, ambiguous: false };
 
   const sec = TRAVEL_SECONDS[mapKey]?.[dest];
@@ -330,43 +300,37 @@ function buildStateEmbed({ userId, name, state, status, travel, titlePrefix = 'S
   // Description/details if present
   if (status?.description) lines.push(`• ${status.description}`);
 
-  // Travel block with exact-ish ETA
-  if (state === 'Traveling') {
-    if (travel?.earliest && travel?.latest) {
-      const earliest = travel.earliest;
-      const latest = travel.latest;
-      const mid = Math.floor((earliest + latest) / 2);
-      const plusMinusMin = Math.max(1, Math.round((latest - earliest) / 120)); // half-window in minutes
+  // Travel block
+  if (travel?.earliest && travel?.latest) {
+    const earliest = travel.earliest;
+    const latest = travel.latest;
+    const mid = Math.floor((earliest + latest) / 2);
+    const plusMinusMin = Math.max(1, Math.round((latest - earliest) / 120)); // half-window in minutes
 
-      const center = ts(mid, 'f'); // absolute local date+time
-      const windowShort = `${ts(earliest, 't')}–${ts(latest, 't')}`;
+    // Exact-looking center time, plus optional window
+    const center = ts(mid, 'f');         // absolute local date+time
+    const windowShort = `${ts(earliest, 't')}–${ts(latest, 't')}`; // times only
 
-      const typePretty = (travel?.type || status?.travel_type || 'unknown').replace(/_/g, ' ');
-      if (travel?.dest) lines.push(`• Destination: ${travel.dest}`);
-      lines.push(`• Travel type: ${typePretty}`);
-
-      if (travel.ambiguous) {
-        lines.push(`• ETA: ${center} (±${plusMinusMin}m)`);
-        lines.push(`• Window: ${windowShort} (standard econ/business; ±5%)`);
-      } else {
-        lines.push(`• ETA: ${center} (±${plusMinusMin}m)`);
-        lines.push(`• Window: ${windowShort} (±5%)`);
-      }
+    if (travel.ambiguous) {
+      lines.push(`• ETA: ${center} (±${plusMinusMin}m)`);
+      lines.push(`• Window: ${windowShort} (standard econ/business; ±5%)`);
     } else {
-      const typePretty = (travel?.type || status?.travel_type || 'unknown').replace(/_/g, ' ');
-      const dest = travel?.dest || parseDestination(status?.description) || null;
-      if (dest) lines.push(`• Destination: ${dest}`);
-      lines.push(`• Travel type: ${typePretty}`);
-      lines.push(`• ETA: unknown`);
+      lines.push(`• ETA: ${center} (±${plusMinusMin}m)`);
+      lines.push(`• Window: ${windowShort} (±5%)`);
     }
+  } else {
+    lines.push(`• ETA: unknown`);
   }
 
   // Jail/Hospital extra
   if (state === 'Jail' || state === 'Hospital') {
+    // We don't have remaining time from this endpoint, so show what we can
     if (status?.details) lines.push(`• Details: ${status.details}`);
   }
 
+  // Abroad/Okay are simple
   emb.setDescription(lines.join('\n') || 'No extra info.');
+
   emb.addFields(
     { name: 'Profile', value: `[Open in Torn](${profileUrl(userId)})`, inline: true },
     { name: 'State', value: `${emoji} ${state}`, inline: true }
@@ -410,7 +374,7 @@ async function primeBaseline(userId) {
     store.watchers[userId].name = name;
     store.watchers[userId].lastState = state;
     store.watchers[userId].travel = null;
-    saveStoreDebounced('prime');
+    saveStoreDebounced();
     console.log(`[prime] Baseline for ${name} (${userId}): ${state}`);
   } catch (e) {
     console.warn(`[prime] Failed for ${userId}:`, e?.response?.status || e.message);
@@ -443,7 +407,7 @@ async function pollNextUser() {
     if (!prev) {
       cfg.lastState = state;
       cfg.travel = null;
-      saveStoreDebounced('init');
+      saveStoreDebounced();
       console.log(`[init] ${name} (${userId}) -> ${state}`);
       isTicking = false;
       return;
@@ -454,7 +418,7 @@ async function pollNextUser() {
       cfg.lastState = state;
 
       // If we care about this state, notify
-      const shouldAlert = Array.isArray(cfg.states) && cfg.states.includes(state);
+      const shouldAlert = cfg.states.includes(state);
       let travel = null;
 
       if (state === 'Traveling') {
@@ -476,7 +440,7 @@ async function pollNextUser() {
         cfg.travel = null;
       }
 
-      saveStoreDebounced('state-change');
+      saveStoreDebounced();
 
       if (shouldAlert) {
         const embed = buildStateEmbed({
@@ -484,23 +448,24 @@ async function pollNextUser() {
           name,
           state,
           status,
-          travel: cfg.travel
+          travel
         });
         await notifyOwnerEmbed(embed);
         console.log(`[change] Notified: ${name} (${userId}) -> ${state}`);
       } else {
         console.log(`[change] ${name} (${userId}) -> ${state} (filtered)`);
       }
-    } else if (state === 'Traveling' && cfg.travel && (!cfg.travel.earliest || !cfg.travel.latest)) {
-      // Try to enrich when initial ETA unknown
-      const dest = parseDestination(status.description) || cfg.travel.dest || null;
-      const type = cfg.travel.type || status.travel_type || 'standard';
-      const window = estimateTravelWindow(type, dest, cfg.travel.startedAt);
-      cfg.travel.dest = dest;
-      cfg.travel.earliest = window.earliest;
-      cfg.travel.latest = window.latest;
-      cfg.travel.ambiguous = window.ambiguous;
-      saveStoreDebounced('enrich-travel');
+    } else if (state === 'Traveling' && cfg.travel && cfg.travel.dest == null) {
+      // Try to enrich travel with dest on subsequent polls if it was missing
+      const dest = parseDestination(status.description);
+      if (dest) {
+        const window = estimateTravelWindow(cfg.travel.type || status.travel_type || 'standard', dest, cfg.travel.startedAt);
+        cfg.travel.dest = dest;
+        cfg.travel.earliest = window.earliest;
+        cfg.travel.latest = window.latest;
+        cfg.travel.ambiguous = window.ambiguous;
+        saveStoreDebounced();
+      }
     }
   } catch (e) {
     const status = e?.response?.status;
@@ -566,10 +531,6 @@ const commands = [
       .setDescription('Send a test DM with a pretty embed')
       .addStringOption(o => o.setName('message').setDescription('Optional message'))
     )
-    .addSubcommand(sc => sc
-      .setName('storage')
-      .setDescription('Show storage path & watcher count')
-    )
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -625,17 +586,17 @@ client.on('interactionCreate', async (interaction) => {
       const [kind, userId] = interaction.customId.split(':');
       if (kind === 'states') {
         if (interaction.user.id !== OWNER_DISCORD_ID) {
-          await interaction.reply({ content: 'Owner only.', ephemeral: inGuildEphemeral(interaction) });
+          await interaction.reply({ content: 'Owner only.', ...inGuildEphemeral(interaction) });
           return;
         }
         const selected = interaction.values || [];
         const cfg = store.watchers[userId];
         if (!cfg) {
-          await interaction.reply({ content: `ID ${userId} not found.`, ephemeral: inGuildEphemeral(interaction) });
+          await interaction.reply({ content: `ID ${userId} not found.`, ...inGuildEphemeral(interaction) });
           return;
         }
         cfg.states = selected;
-        saveStoreDebounced('set-states');
+        saveStoreDebounced();
         await interaction.update({
           content: `Updated states for ${cfg.name || userId}: ${selected.length ? selected.join(', ') : '(none)'}`,
           components: [statesSelectRow(userId, cfg.states), enableButtonsRow(userId, cfg.enabled !== false)]
@@ -647,18 +608,18 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton()) {
       const [kind, userId] = interaction.customId.split(':');
       if (interaction.user.id !== OWNER_DISCORD_ID) {
-        await interaction.reply({ content: 'Owner only.', ephemeral: inGuildEphemeral(interaction) });
+        await interaction.reply({ content: 'Owner only.', ...inGuildEphemeral(interaction) });
         return;
       }
       const cfg = store.watchers[userId];
       if (!cfg) {
-        await interaction.reply({ content: `ID ${userId} not found.`, ephemeral: inGuildEphemeral(interaction) });
+        await interaction.reply({ content: `ID ${userId} not found.`, ...inGuildEphemeral(interaction) });
         return;
       }
 
       if (kind === 'toggle') {
         cfg.enabled = cfg.enabled === false ? true : false;
-        saveStoreDebounced('toggle');
+        saveStoreDebounced();
         refreshPollOrder();
         await interaction.update({
           content: `${cfg.enabled !== false ? 'Enabled' : 'Disabled'} watching for ${cfg.name || userId}.`,
@@ -669,7 +630,7 @@ client.on('interactionCreate', async (interaction) => {
 
       if (kind === 'remove') {
         delete store.watchers[userId];
-        saveStoreDebounced('remove');
+        saveStoreDebounced();
         refreshPollOrder();
         await interaction.update({ content: `Removed watcher for ${userId}.`, components: [] });
         return;
@@ -681,15 +642,12 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName !== 'watch') return;
 
     if (interaction.user.id !== OWNER_DISCORD_ID) {
-      await interaction.reply({ content: 'Nope. Owner-only command.', ephemeral: inGuildEphemeral(interaction) });
+      await interaction.reply({ content: 'Nope. Owner-only command.', ...inGuildEphemeral(interaction) });
       return;
     }
 
     const sub = interaction.options.getSubcommand();
-    const isEph = inGuildEphemeral(interaction);
-
-    // Acknowledge fast to avoid 10062 on cold starts
-    try { await interaction.deferReply({ ephemeral: isEph }); } catch {}
+    const eph = inGuildEphemeral(interaction);
 
     if (sub === 'add') {
       const userId = String(interaction.options.getInteger('user_id'));
@@ -697,7 +655,7 @@ client.on('interactionCreate', async (interaction) => {
       let states = statesInput ? parseStatesInput(statesInput) : [...DEFAULT_STATES_LIST];
 
       if (store.watchers[userId]) {
-        await interaction.editReply({ content: `Already watching ID ${userId}. Use /watch states or /watch menu.` });
+        await interaction.reply({ content: `Already watching ID ${userId}. Use /watch states or /watch menu.`, ...eph });
         return;
       }
 
@@ -708,39 +666,39 @@ client.on('interactionCreate', async (interaction) => {
         name: `User ${userId}`,
         travel: null
       };
-      saveStoreDebounced('add');
+      saveStoreDebounced();
       refreshPollOrder();
 
-      await interaction.editReply({ content: `Adding watcher for ${userId} (${states.join(', ')}) — priming baseline...` });
+      await interaction.reply({ content: `Adding watcher for ${userId} (${states.join(', ')}) — priming baseline...`, ...eph });
       await primeBaseline(userId);
-      await interaction.followUp({ content: `Watcher added for ${store.watchers[userId].name} (${userId}).`, ephemeral: isEph });
+      await interaction.followUp({ content: `Watcher added for ${store.watchers[userId].name} (${userId}).`, ...eph });
       return;
     }
 
     if (sub === 'remove') {
       const userId = String(interaction.options.getInteger('user_id'));
       if (!store.watchers[userId]) {
-        await interaction.editReply({ content: `ID ${userId} is not watched.` });
+        await interaction.reply({ content: `ID ${userId} is not watched.`, ...eph });
         return;
       }
       delete store.watchers[userId];
-      saveStoreDebounced('remove');
+      saveStoreDebounced();
       refreshPollOrder();
-      await interaction.editReply({ content: `Removed watcher for ID ${userId}.` });
+      await interaction.reply({ content: `Removed watcher for ID ${userId}.`, ...eph });
       return;
     }
 
     if (sub === 'list') {
       const entries = Object.entries(store.watchers);
       if (!entries.length) {
-        await interaction.editReply({ content: 'No watchers configured.' });
+        await interaction.reply({ content: 'No watchers configured.', ...eph });
         return;
       }
       const lines = entries.map(([uid, cfg]) => {
         const st = cfg.enabled === false ? 'disabled' : 'enabled';
         return `• ${cfg.name || 'User'} (${uid}) — ${st} — states: ${cfg.states.join(', ')}`;
       });
-      await interaction.editReply({ content: lines.join('\n') });
+      await interaction.reply({ content: lines.join('\n'), ...eph });
       return;
     }
 
@@ -748,19 +706,19 @@ client.on('interactionCreate', async (interaction) => {
       const userId = String(interaction.options.getInteger('user_id'));
       const statesInput = interaction.options.getString('states');
       if (!store.watchers[userId]) {
-        await interaction.editReply({ content: `ID ${userId} is not watched. Use /watch add first.` });
+        await interaction.reply({ content: `ID ${userId} is not watched. Use /watch add first.`, ...eph });
         return;
       }
       let states;
       try {
         states = parseStatesInput(statesInput);
       } catch (e) {
-        await interaction.editReply({ content: e.message });
+        await interaction.reply({ content: e.message, ...eph });
         return;
       }
       store.watchers[userId].states = states;
-      saveStoreDebounced('set-states');
-      await interaction.editReply({ content: `Updated states for ${userId} -> ${states.join(', ')}` });
+      saveStoreDebounced();
+      await interaction.reply({ content: `Updated states for ${userId} -> ${states.join(', ')}`, ...eph });
       return;
     }
 
@@ -768,7 +726,7 @@ client.on('interactionCreate', async (interaction) => {
       const userId = String(interaction.options.getInteger('user_id'));
       const cfg = store.watchers[userId];
       if (!cfg) {
-        await interaction.editReply({ content: `ID ${userId} is not watched. Use /watch add first.` });
+        await interaction.reply({ content: `ID ${userId} is not watched. Use /watch add first.`, ...eph });
         return;
       }
       const embed = new EmbedBuilder()
@@ -780,9 +738,10 @@ client.on('interactionCreate', async (interaction) => {
           { name: 'Status', value: cfg.enabled === false ? 'disabled' : 'enabled', inline: true },
           { name: 'User', value: `[Profile](${profileUrl(userId)})`, inline: true }
         );
-      await interaction.editReply({
+      await interaction.reply({
         embeds: [embed],
-        components: [statesSelectRow(userId, cfg.states), enableButtonsRow(userId, cfg.enabled !== false)]
+        components: [statesSelectRow(userId, cfg.states), enableButtonsRow(userId, cfg.enabled !== false)],
+        ...eph
       });
       return;
     }
@@ -791,27 +750,27 @@ client.on('interactionCreate', async (interaction) => {
       const userId = String(interaction.options.getInteger('user_id'));
       const on = interaction.options.getBoolean('on');
       if (!store.watchers[userId]) {
-        await interaction.editReply({ content: `ID ${userId} is not watched.` });
+        await interaction.reply({ content: `ID ${userId} is not watched.`, ...eph });
         return;
       }
       store.watchers[userId].enabled = !!on;
-      saveStoreDebounced('toggle');
+      saveStoreDebounced();
       refreshPollOrder();
-      await interaction.editReply({ content: `${on ? 'Enabled' : 'Disabled'} watching for ${userId}.` });
+      await interaction.reply({ content: `${on ? 'Enabled' : 'Disabled'} watching for ${userId}.`, ...eph });
       return;
     }
 
     if (sub === 'interval') {
       const ms = interaction.options.getInteger('ms');
       if (!Number.isFinite(ms) || ms < 1000) {
-        await interaction.editReply({ content: 'Interval must be >= 1000 ms.' });
+        await interaction.reply({ content: 'Interval must be >= 1000 ms.', ...eph });
         return;
       }
       store.requestMs = ms;
-      saveStoreDebounced('interval');
+      saveStoreDebounced();
       restartPollTimer();
       const perCycle = pollOrder.length ? ((ms * pollOrder.length) / 1000).toFixed(1) : '0';
-      await interaction.editReply({ content: `Polling interval set to ${ms} ms (≈ ${perCycle}s per cycle).` });
+      await interaction.reply({ content: `Polling interval set to ${ms} ms (≈ ${perCycle}s per cycle).`, ...eph });
       return;
     }
 
@@ -819,7 +778,7 @@ client.on('interactionCreate', async (interaction) => {
       const userId = String(interaction.options.getInteger('user_id'));
       const cfg = store.watchers[userId];
       if (!cfg) {
-        await interaction.editReply({ content: `ID ${userId} is not watched.` });
+        await interaction.reply({ content: `ID ${userId} is not watched.`, ...eph });
         return;
       }
       try {
@@ -832,9 +791,9 @@ client.on('interactionCreate', async (interaction) => {
           status,
           travel: cfg.travel
         });
-        await interaction.editReply({ embeds: [embed] });
+        await interaction.reply({ embeds: [embed], ...eph });
       } catch (e) {
-        await interaction.editReply({ content: `Fetch failed: ${e?.response?.status || e.message}` });
+        await interaction.reply({ content: `Fetch failed: ${e?.response?.status || e.message}`, ...eph });
       }
       return;
     }
@@ -847,26 +806,14 @@ client.on('interactionCreate', async (interaction) => {
         .setDescription(msg)
         .setTimestamp(new Date());
       await notifyOwnerEmbed(embed);
-      await interaction.editReply({ content: 'Sent you a DM. If you didn’t get it, check privacy settings.' });
+      await interaction.reply({ content: 'Sent you a DM. If you didn’t get it, check privacy settings.', ...eph });
       return;
     }
-
-    if (sub === 'storage') {
-      await interaction.editReply({
-        content: `Path: ${STORE_PATH}\nWatchers: ${Object.keys(store.watchers).length}\nInterval: ${store.requestMs}ms`
-      });
-      return;
-    }
-
   } catch (e) {
     console.error('[cmd] Error:', e);
-    try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply({ content: `Error: ${e.message}` });
-      } else {
-        await interaction.reply({ content: `Error: ${e.message}`, ephemeral: inGuildEphemeral(interaction) });
-      }
-    } catch {}
+    if (interaction.isRepliable()) {
+      try { await interaction.reply({ content: `Error: ${e.message}`, ...inGuildEphemeral(interaction) }); } catch {}
+    }
   }
 });
 
@@ -886,7 +833,7 @@ loadStore();
         travel: null
       };
     }
-    saveStoreDebounced('seed');
+    saveStoreDebounced();
     console.log(`[seed] Seeded ${ids.length} watcher(s) from USER_IDS.`);
   }
 })();
@@ -916,5 +863,5 @@ client.login(DISCORD_TOKEN).catch(err => {
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => { console.log('SIGINT'); saveStoreNow('exit'); setTimeout(() => process.exit(0), 200); });
-process.on('SIGTERM', () => { console.log('SIGTERM'); saveStoreNow('exit'); setTimeout(() => process.exit(0), 200); });
+process.on('SIGINT', () => { console.log('SIGINT'); saveStoreDebounced(); setTimeout(() => process.exit(0), 300); });
+process.on('SIGTERM', () => { console.log('SIGTERM'); saveStoreDebounced(); setTimeout(() => process.exit(0), 300); });
