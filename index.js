@@ -256,8 +256,8 @@ let store = {
       // [factionId]: {
       //   id, name, tag, enabled,
       //   states: string[],
-      //   preTimesSec?: number[], // NEW: pre-alert thresholds in seconds
-      //   members: { [userId]: { name, lastState, lastActionTs, offlineNotified, preFired } },
+      //   preTimesSec?: number[],
+      //   members: { [userId]: { name, lastState, lastActionTs, offlineNotified, preFired, travel } },
       //   lastRespect, lastRespectStep,
       //   offline: { enabled, hours },
       //   daily: { enabled, respectAtMidnight, lastMidnightISO }
@@ -293,12 +293,13 @@ function loadStore() {
         } else {
           if (!Number.isFinite(store.factions.requestMs) || store.factions.requestMs < 10_000) store.factions.requestMs = 30_000;
           store.factions.items = store.factions.items || {};
-          // Ensure member maps have preFired
           for (const fid of Object.keys(store.factions.items)) {
             const fconf = store.factions.items[fid];
             if (fconf && fconf.members) {
               for (const uid of Object.keys(fconf.members)) {
-                fconf.members[uid].preFired = fconf.members[uid].preFired || {};
+                const m = fconf.members[uid];
+                m.preFired = m.preFired || {};
+                if (m.travel && typeof m.travel !== 'object') m.travel = null;
               }
             }
           }
@@ -538,17 +539,41 @@ function buildTravelDirectionEmbed(name, userId, travel, status) {
   return emb;
 }
 
-// Faction embeds
-function buildFactionMemberStateEmbed(factionName, uid, member, oldState, newState) {
+// Faction embeds (now include travel details)
+function buildFactionMemberStateEmbed(factionName, uid, member, oldState, newState, travel = null) {
   const emoji = STATE_EMOJI[newState] || '🔔';
   const color = STATE_COLORS[newState] || COLOR_INFO;
-  const until = member?.status?.until ? ` • ends ${ts(Number(member.status.until), 't')}` : '';
   const descRaw = member?.status?.description ? stripTags(member.status.description).trim() : '';
-  const desc = descRaw ? `\n${descRaw}` : '';
+  const until = member?.status?.until ? Number(member.status.until) : 0;
+
+  const lines = [`Faction: ${factionName}`];
+
+  if (newState === 'Traveling') {
+    if (travel?.earliest && travel?.latest) {
+      const earliest = travel.earliest;
+      const latest = travel.latest;
+      const mid = Math.floor((earliest + latest) / 2);
+      const plusMinusMin = Math.max(1, Math.round((latest - earliest) / 120));
+      const windowShort = `${ts(earliest, 't')}–${ts(latest, 't')}`;
+      const typePretty = (travel?.type || 'standard').replace(/_/g, ' ');
+      const direction = travel?.direction === 'return' ? 'return' : 'outbound';
+      if (travel?.dest) lines.push(`• Destination: ${direction === 'return' ? 'Torn (from ' + travel.dest + ')' : travel.dest}`);
+      lines.push(`• Travel type: ${typePretty}`);
+      lines.push(`• ETA: ${ts(mid, 'f')} (±${plusMinusMin}m)`);
+      lines.push(`• Window: ${windowShort} (±5%)`);
+    } else {
+      if (descRaw) lines.push(`• ${descRaw}`);
+      lines.push('• ETA: unknown');
+    }
+  } else {
+    if (descRaw) lines.push(descRaw);
+    if ((newState === 'Jail' || newState === 'Hospital') && until) lines.push(`Ends: ${ts(until, 't')}`);
+  }
+
   return new EmbedBuilder()
     .setColor(color)
     .setTitle(`${emoji} ${member.name} → ${newState}`)
-    .setDescription(`Faction: ${factionName}${desc}${until}`)
+    .setDescription(lines.join('\n'))
     .addFields(
       { name: 'Prev', value: oldState || '(unknown)', inline: true },
       { name: 'Now', value: newState, inline: true },
@@ -590,7 +615,7 @@ function buildFactionOfflineEmbed(factionName, uid, name, lastTs, hours) {
     .addFields({ name: 'Profile', value: `[Open in Torn](${profileUrl(uid)})`, inline: true })
     .setTimestamp(new Date());
 }
-// NEW: faction pre-alert embed
+// Faction pre-alert embed
 function buildFactionPreAlertEmbed(factionName, uid, memberName, state, endAt, secsLeft) {
   const emoji = STATE_EMOJI[state] || '⏰';
   return new EmbedBuilder()
@@ -690,7 +715,6 @@ async function maybePreAlert(userId, name, state, status, travel, preTimesSec) {
   }
   if (sent) {
     cfg.preFired[key] = [...fired];
-    // prune old keys (keep last 10)
     const keys = Object.keys(cfg.preFired);
     if (keys.length > 10) {
       for (const k of keys.slice(0, keys.length - 10)) delete cfg.preFired[k];
@@ -1036,9 +1060,15 @@ function restartFactionPollTimer() {
   pollNextFaction().catch(()=>{});
 }
 
-function factionSessionKeyForState(state, member) {
+function factionSessionKeyForState(state, member, travel) {
+  if (state === 'Traveling' && travel?.startedAt) {
+    const dir = travel?.direction || 'outbound';
+    return `T:${dir}:${travel.startedAt}`;
+  }
   const until = Number(member?.status?.until || 0);
-  if (until) return `${state[0]}:${until}`;
+  if ((state === 'Jail' || state === 'Hospital') && until) {
+    return `${state[0]}:${until}`;
+  }
   return null;
 }
 
@@ -1049,17 +1079,24 @@ async function maybeFactionPreAlert(fid, fName, fconf, uid, member) {
   const state = member?.status?.state || 'Okay';
   if (!Array.isArray(fconf.states) || !fconf.states.includes(state)) return;
 
-  const until = Number(member?.status?.until || 0);
-  if (!Number.isFinite(until) || until <= 0) return; // only if API provides an end time
+  let endAt = null;
+  const travel = fconf.members[uid]?.travel || null;
+  if (state === 'Traveling' && travel?.earliest) {
+    endAt = travel.earliest;
+  } else if ((state === 'Jail' || state === 'Hospital') && Number(member?.status?.until || 0)) {
+    endAt = Number(member.status.until);
+  } else {
+    return;
+  }
 
   const now = Math.floor(Date.now() / 1000);
-  const left = until - now;
+  const left = endAt - now;
   if (left <= 0) return;
 
-  const key = factionSessionKeyForState(state, member);
+  const key = factionSessionKeyForState(state, member, travel);
   if (!key) return;
 
-  const cached = fconf.members[uid] || (fconf.members[uid] = { name: member.name, lastState: state, lastActionTs: null, offlineNotified: false, preFired: {} });
+  const cached = fconf.members[uid] || (fconf.members[uid] = { name: member.name, lastState: state, lastActionTs: null, offlineNotified: false, preFired: {}, travel: null });
   cached.preFired = cached.preFired || {};
   const fired = new Set(cached.preFired[key] || []);
 
@@ -1068,7 +1105,7 @@ async function maybeFactionPreAlert(fid, fName, fconf, uid, member) {
     if (left <= t && !fired.has(t)) {
       fired.add(t);
       sent = true;
-      const emb = buildFactionPreAlertEmbed(fName, uid, member.name, state, until, left);
+      const emb = buildFactionPreAlertEmbed(fName, uid, member.name, state, endAt, left);
       await notifyOwnerEmbed(emb);
       console.log(`[factions-pre] ${member.name} (${uid}) ${state} ~${left}s (fid ${fid}, thr ${t}s)`);
     }
@@ -1132,8 +1169,27 @@ async function pollNextFaction() {
           lastState: m?.status?.state || null,
           lastActionTs: m?.last_action?.timestamp || null,
           offlineNotified: false,
-          preFired: {}
+          preFired: {},
+          travel: null
         };
+        // Seed travel if currently traveling
+        const curState = m?.status?.state || 'Okay';
+        if (curState === 'Traveling') {
+          const desc = m?.status?.description || '';
+          const dir = parseTravelDirection(desc);
+          const dest = parseDestination(desc);
+          const startedAt = Date.now();
+          const window = estimateTravelWindow('standard', dest, startedAt);
+          prevMap[uid].travel = {
+            startedAt,
+            type: 'standard',
+            dest: dest || null,
+            earliest: window.earliest,
+            latest: window.latest,
+            ambiguous: window.ambiguous,
+            direction: dir
+          };
+        }
         console.log(`[factions] Join: ${m.name} (${uid}) in ${fName}`);
       }
     }
@@ -1148,7 +1204,7 @@ async function pollNextFaction() {
       }
     }
 
-    // State changes + offline > N hours + pre-alerts
+    // State changes + offline > N hours + pre-alerts + travel ETA
     const watchStates = new Set(fconf.states || []);
     const offlineHours = Number(fconf.offline?.hours || FACTION_OFFLINE_HOURS || 24);
     const offlineEnabled = fconf.offline?.enabled !== false;
@@ -1158,18 +1214,78 @@ async function pollNextFaction() {
     for (const uid of Object.keys(newMap)) {
       const m = newMap[uid];
       const curState = m?.status?.state || 'Okay';
-      const last = prevMap[uid] || (prevMap[uid] = { name: m.name, lastState: null, lastActionTs: null, offlineNotified: false, preFired: {} });
+      const desc = m?.status?.description || '';
+      const dir = parseTravelDirection(desc);
+      const dest = parseDestination(desc);
+
+      const last = prevMap[uid] || (prevMap[uid] = { name: m.name, lastState: null, lastActionTs: null, offlineNotified: false, preFired: {}, travel: null });
+
+      // Handle travel session upkeep/enrichment even if no state change yet
+      if (curState === 'Traveling') {
+        if (!last.travel) {
+          // start new session (baseline or missed change)
+          const startedAt = Date.now();
+          const window = estimateTravelWindow('standard', dest, startedAt);
+          last.travel = {
+            startedAt,
+            type: 'standard',
+            dest: dest || null,
+            earliest: window.earliest,
+            latest: window.latest,
+            ambiguous: window.ambiguous,
+            direction: dir
+          };
+        } else {
+          // direction/destination change mid-travel
+          const prevDir = last.travel.direction || 'outbound';
+          const prevDest = last.travel.dest || null;
+          if (dir !== prevDir || (dest || null) !== prevDest) {
+            const startedAt = Date.now();
+            const window = estimateTravelWindow(last.travel.type || 'standard', dest, startedAt);
+            last.travel = {
+              startedAt,
+              type: last.travel.type || 'standard',
+              dest: dest || null,
+              earliest: window.earliest,
+              latest: window.latest,
+              ambiguous: window.ambiguous,
+              direction: dir
+            };
+            saveStoreDebounced('factions-travel-dir-change');
+            if (watchStates.has('Traveling')) {
+              const emb = buildFactionMemberStateEmbed(fName, uid, m, last.lastState || 'Traveling', 'Traveling', last.travel);
+              await notifyOwnerEmbed(emb);
+              console.log(`[factions] Travel change: ${m.name} (${uid}) ${prevDir}/${prevDest} -> ${dir}/${dest} in ${fName}`);
+            }
+          } else if ((!last.travel.dest && dest) || (!last.travel.earliest || !last.travel.latest)) {
+            // enrich missing ETA when dest becomes known
+            const window = estimateTravelWindow(last.travel.type || 'standard', dest, last.travel.startedAt || Date.now());
+            last.travel.dest = dest || last.travel.dest || null;
+            last.travel.earliest = window.earliest;
+            last.travel.latest = window.latest;
+            last.travel.ambiguous = window.ambiguous;
+            saveStoreDebounced('factions-travel-enrich');
+          }
+        }
+      } else {
+        // Not traveling: clear travel session
+        if (last.travel) {
+          last.travel = null;
+        }
+      }
 
       // State change alert
       if (last.lastState && curState !== last.lastState && watchStates.has(curState)) {
-        const emb = buildFactionMemberStateEmbed(fName, uid, m, last.lastState, curState);
+        // Reset preFired for new session (J/H or new Traveling)
+        const key = factionSessionKeyForState(curState, m, last.travel);
+        if (key && last.preFired) delete last.preFired[key];
+
+        const emb = buildFactionMemberStateEmbed(fName, uid, m, last.lastState, curState, curState === 'Traveling' ? last.travel : null);
         await notifyOwnerEmbed(emb);
         console.log(`[factions] State: ${m.name} (${uid}) ${last.lastState} -> ${curState} in ${fName}`);
-
-        // Reset preFired for new session key
-        const key = factionSessionKeyForState(curState, m);
-        if (key && last.preFired) delete last.preFired[key];
       }
+
+      // Update last snapshot
       last.name = m.name;
       last.lastState = curState;
 
@@ -1193,7 +1309,7 @@ async function pollNextFaction() {
       last.lastActionTs = tsLast || last.lastActionTs;
       prevMap[uid] = last;
 
-      // NEW: pre-alerts for this member state (if until available)
+      // Pre-alerts (now supports Traveling via estimated earliest)
       await maybeFactionPreAlert(fid, fName, fconf, uid, m);
     }
 
@@ -1235,7 +1351,6 @@ async function runFactionsDailyDigest() {
         if (fconf.daily == null) fconf.daily = { enabled: true, respectAtMidnight: null, lastMidnightISO: null };
 
         if (fconf.daily.respectAtMidnight == null) {
-          // seed baseline only
           fconf.daily.respectAtMidnight = cur;
           fconf.daily.lastMidnightISO = new Date().toISOString().slice(0,10);
           console.log(`[factions-daily] Seed baseline for ${name} (${fid}) -> ${cur}`);
