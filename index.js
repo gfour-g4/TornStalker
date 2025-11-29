@@ -26,7 +26,10 @@ const {
   SELF_PING_URL,
   GUILD_ID,
   PORT,
-  PERSIST_PATH
+  PERSIST_PATH,
+  FACTION_ID,
+  FACTION_INTERVAL_MS,
+  FACTION_OFFLINE_HOURS
 } = process.env;
 
 // ========= Consts =========
@@ -55,6 +58,7 @@ const BARS = ['energy', 'nerve', 'happy', 'life']; // NEW
 const COOLDOWNS = ['drug', 'medical', 'booster']; // NEW
 
 const SELF_PING_MS = 12 * 60 * 1000;
+
 
 // Travel durations (seconds) — using 'UAE' as requested
 const TRAVEL_SECONDS = {
@@ -113,6 +117,7 @@ const TRAVEL_SECONDS = {
 };
 
 const DEFAULT_STATES_LIST = parseStatesInput(DEFAULT_STATES || 'Traveling,Jail,Hospital');
+const RESPECT_STEP = 100_000; // fire when total respect crosses each 100k
 
 // ========= Env checks =========
 function assertEnv(name, value) {
@@ -186,6 +191,13 @@ const tornUser = axios.create({
   timeout: 12000
 });
 
+async function fetchFactionBasic(fid) {
+  const params = { key: TORN_API_KEY, selections: 'basic' };
+  const { data } = await tornUser.get(`/faction/${encodeURIComponent(fid)}`, { params });
+  if (!data || !data.members) throw new Error('Malformed faction response');
+  return data;
+}
+
 async function fetchTornProfile(userId) {
   const url = `/user/${encodeURIComponent(userId)}/basic`;
   const params = { striptags: true, key: TORN_API_KEY };
@@ -243,6 +255,25 @@ let store = {
       epochId: 0, // increments when chain resets / drops
       fired: {} // { [epochId]: Set<number> }
     }
+  },
+  faction: {
+    id: FACTION_ID ? String(FACTION_ID) : null,
+    name: null,
+    tag: null,
+    enabled: !!FACTION_ID,
+    requestMs: Number(FACTION_INTERVAL_MS || 30000), // poll every 30s by default
+    states: [...DEFAULT_STATES_LIST], // which member states to alert on
+    members: {
+      // [userId]: { name, lastState, lastActionTs, offlineNotified }
+    },
+    lastRespect: null,
+    lastRespectStep: null,
+    offline: { enabled: true, hours: Number(FACTION_OFFLINE_HOURS || 24) },
+    daily: {
+      enabled: true,
+      respectAtMidnight: null, // snapshot taken at UTC midnight
+      lastMidnightISO: null
+    }
   }
 };
 
@@ -254,9 +285,32 @@ function loadStore() {
         const json = JSON.parse(raw);
         store = Object.assign(store, json);
 
-        // sanity
         if (!store.watchers || typeof store.watchers !== 'object') store.watchers = {};
         if (!store.self) store.self = { bars: { energy:false, nerve:false, happy:false, life:false, last:{}, wasFull:{} }, cooldowns: { drug:false, medical:false, booster:false, last:{} }, chain: { enabled:false, min:10, thresholds:[120,90,60,30], last:{}, epochId:0, fired:{} } };
+
+        // NEW: ensure faction defaults
+        if (!store.faction) {
+          store.faction = {
+            id: FACTION_ID ? String(FACTION_ID) : null,
+            name: null,
+            tag: null,
+            enabled: !!FACTION_ID,
+            requestMs: Number(FACTION_INTERVAL_MS || 30000),
+            states: [...DEFAULT_STATES_LIST],
+            members: {},
+            lastRespect: null,
+            lastRespectStep: null,
+            offline: { enabled: true, hours: Number(FACTION_OFFLINE_HOURS || 24) },
+            daily: { enabled: true, respectAtMidnight: null, lastMidnightISO: null }
+          };
+        } else {
+          store.faction.requestMs = Number(store.faction.requestMs || 30000);
+          store.faction.states = Array.isArray(store.faction.states) ? store.faction.states : [...DEFAULT_STATES_LIST];
+          store.faction.members = store.faction.members || {};
+          store.faction.offline = store.faction.offline || { enabled: true, hours: 24 };
+          store.faction.daily = store.faction.daily || { enabled: true, respectAtMidnight: null, lastMidnightISO: null };
+        }
+
         if (!Number.isFinite(store.requestMs) || store.requestMs < 1000) store.requestMs = 5000;
         console.log(`[store] Loaded from ${STORE_PATH}`);
       } else {
@@ -439,6 +493,62 @@ function buildStateEmbed({ userId, name, state, status, travel, titlePrefix = 'S
   return emb;
 }
 
+function buildFactionMemberStateEmbed(factionName, uid, member, oldState, newState) {
+  const emoji = STATE_EMOJI[newState] || '🔔';
+  const color = STATE_COLORS[newState] || COLOR_INFO;
+  const until = member?.status?.until ? ` • ends ${ts(Number(member.status.until), 't')}` : '';
+  const desc = member?.status?.description ? `\n${member.status.description.trim()}` : '';
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle(`${emoji} ${member.name} → ${newState}`)
+    .setDescription(`Faction: ${factionName}${desc}${until}`)
+    .addFields(
+      { name: 'Prev', value: oldState || '(unknown)', inline: true },
+      { name: 'Now', value: newState, inline: true },
+      { name: 'Profile', value: `[Open in Torn](${profileUrl(uid)})`, inline: true }
+    )
+    .setTimestamp(new Date());
+}
+
+function buildFactionJoinLeaveEmbed(kind, factionName, uid, name) {
+  const joining = kind === 'join';
+  return new EmbedBuilder()
+    .setColor(joining ? COLOR_GOOD : COLOR_BAD)
+    .setTitle(`${joining ? '🟢 Joined' : '🔴 Left'} ${factionName}`)
+    .setDescription(`${name} (${uid}) ${joining ? 'joined' : 'left'} the faction`)
+    .addFields({ name: 'Profile', value: `[Open in Torn](${profileUrl(uid)})`, inline: true })
+    .setTimestamp(new Date());
+}
+
+function buildFactionRespectStepEmbed(factionName, prevRespect, curRespect) {
+  const prevStep = Math.floor((prevRespect || 0) / RESPECT_STEP) * RESPECT_STEP;
+  const newStep = Math.floor((curRespect || 0) / RESPECT_STEP) * RESPECT_STEP;
+  return new EmbedBuilder()
+    .setColor(COLOR_GOOD)
+    .setTitle(`🏆 ${factionName} hit ${newStep.toLocaleString()} respect`)
+    .setDescription(`Previous: ${prevRespect?.toLocaleString() || '—'}\nNow: ${curRespect.toLocaleString()}`)
+    .setTimestamp(new Date());
+}
+
+function buildFactionDailyDigestEmbed(factionName, delta, cur) {
+  const up = delta >= 0;
+  return new EmbedBuilder()
+    .setColor(up ? COLOR_GOOD : COLOR_BAD)
+    .setTitle(`📈 ${factionName} daily respect`)
+    .setDescription(`${up ? 'Gained' : 'Lost'} ${Math.abs(delta).toLocaleString()} respect in the last 24h`)
+    .addFields({ name: 'Total now', value: cur.toLocaleString(), inline: true })
+    .setTimestamp(new Date());
+}
+
+function buildFactionOfflineEmbed(factionName, uid, name, lastTs, hours) {
+  return new EmbedBuilder()
+    .setColor(COLOR_WARN)
+    .setTitle(`⛔ ${name} offline > ${hours}h`)
+    .setDescription(`Faction: ${factionName}\nLast action: ${ts(Number(lastTs), 'f')} (${ts(Number(lastTs), 'R')})`)
+    .addFields({ name: 'Profile', value: `[Open in Torn](${profileUrl(uid)})`, inline: true })
+    .setTimestamp(new Date());
+}
+
 // NEW: embeds
 function buildBarFullEmbed(kind, bar) {
   const pretty = capitalize(kind);
@@ -548,6 +658,176 @@ function sessionKeyForState(state, status, travel) {
     return `${state[0]}:${status.until}`;
   }
   return null;
+}
+
+let factionTimer = null;
+let factionDailyTimer = null;
+
+function restartFactionTimer() {
+  if (factionTimer) clearInterval(factionTimer);
+  if (!store.faction?.enabled || !store.faction?.id) {
+    console.log('[faction] Disabled');
+    return;
+  }
+  const interval = Math.max(10_000, Number(store.faction.requestMs || 30_000));
+  factionTimer = setInterval(pollFaction, interval);
+  console.log(`[faction] Polling every ${Math.round(interval/1000)}s`);
+  pollFaction().catch(() => {});
+}
+
+function nextUtcMidnightDelayMs() {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 5)); // 00:00:05 UTC
+  return Math.max(1000, next - now);
+}
+
+function restartFactionDailyTimer() {
+  if (factionDailyTimer) clearTimeout(factionDailyTimer);
+  if (!store.faction?.enabled || !store.faction?.id || store.faction?.daily?.enabled === false) {
+    console.log('[faction-daily] Disabled');
+    return;
+  }
+  const ms = nextUtcMidnightDelayMs();
+  factionDailyTimer = setTimeout(() => runFactionDailyDigest().catch(()=>{}), ms);
+  console.log(`[faction-daily] Next digest in ~${Math.round(ms/1000)}s`);
+}
+
+async function runFactionDailyDigest() {
+  try {
+    if (!store.faction?.enabled || !store.faction?.id || store.faction?.daily?.enabled === false) {
+      restartFactionDailyTimer();
+      return;
+    }
+    const fid = store.faction.id;
+    const data = await fetchFactionBasic(fid);
+    const cur = Number(data.respect || 0);
+    const name = data.name || `Faction ${fid}`;
+
+    // first ever: set baseline and don't send a diff
+    if (store.faction.daily.respectAtMidnight == null) {
+      store.faction.daily.respectAtMidnight = cur;
+      store.faction.daily.lastMidnightISO = new Date().toISOString().slice(0,10);
+      saveStoreDebounced('faction-daily-baseline');
+    } else {
+      const delta = cur - Number(store.faction.daily.respectAtMidnight || 0);
+      const emb = buildFactionDailyDigestEmbed(name, delta, cur);
+      await notifyOwnerEmbed(emb);
+      // rollover baseline to now
+      store.faction.daily.respectAtMidnight = cur;
+      store.faction.daily.lastMidnightISO = new Date().toISOString().slice(0,10);
+      saveStoreDebounced('faction-daily');
+    }
+  } catch (e) {
+    console.warn('[faction-daily] Error:', e?.response?.status || e.message);
+  } finally {
+    restartFactionDailyTimer();
+  }
+}
+
+async function pollFaction() {
+  if (!store.faction?.enabled || !store.faction?.id) return;
+  const fid = store.faction.id;
+  try {
+    const data = await fetchFactionBasic(fid);
+    const fName = data.name || `Faction ${fid}`;
+    store.faction.name = data.name || store.faction.name;
+    store.faction.tag = data.tag || store.faction.tag;
+
+    // Respect milestones
+    const curRespect = Number(data.respect || 0);
+    const prevRespect = Number(store.faction.lastRespect ?? curRespect);
+    const prevStep = Number.isFinite(store.faction.lastRespectStep) ? store.faction.lastRespectStep : Math.floor(prevRespect / RESPECT_STEP);
+    const stepNow = Math.floor(curRespect / RESPECT_STEP);
+    if (stepNow > prevStep) {
+      const emb = buildFactionRespectStepEmbed(fName, prevRespect, curRespect);
+      await notifyOwnerEmbed(emb);
+      console.log(`[faction] Respect milestone: ${prevRespect} -> ${curRespect}`);
+    }
+    store.faction.lastRespect = curRespect;
+    store.faction.lastRespectStep = stepNow;
+
+    // Membership diff
+    const prevMap = store.faction.members || {};
+    const newMap = data.members || {};
+    const prevIds = new Set(Object.keys(prevMap));
+    const newIds = new Set(Object.keys(newMap));
+
+    // Joins
+    for (const uid of newIds) {
+      if (!prevIds.has(uid)) {
+        const m = newMap[uid];
+        const emb = buildFactionJoinLeaveEmbed('join', fName, uid, m.name);
+        await notifyOwnerEmbed(emb);
+        prevMap[uid] = {
+          name: m.name,
+          lastState: m?.status?.state || null,
+          lastActionTs: m?.last_action?.timestamp || null,
+          offlineNotified: false
+        };
+        console.log(`[faction] Join: ${m.name} (${uid})`);
+      }
+    }
+    // Leaves
+    for (const uid of prevIds) {
+      if (!newIds.has(uid)) {
+        const prev = prevMap[uid];
+        const emb = buildFactionJoinLeaveEmbed('leave', fName, uid, prev?.name || uid);
+        await notifyOwnerEmbed(emb);
+        delete prevMap[uid];
+        console.log(`[faction] Leave: ${prev?.name || uid}`);
+      }
+    }
+
+    // State changes + offline > N hours
+    const watchStates = new Set(store.faction.states || []);
+    const offlineHours = Number(store.faction.offline?.hours || 24);
+    const offlineEnabled = store.faction.offline?.enabled !== false;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const offlineThresh = offlineHours * 3600;
+
+    for (const uid of Object.keys(newMap)) {
+      const m = newMap[uid];
+      const curState = m?.status?.state || 'Okay';
+      const last = prevMap[uid] || (prevMap[uid] = { name: m.name, lastState: null, lastActionTs: null, offlineNotified: false });
+
+      // State change alert
+      if (last.lastState && curState !== last.lastState && watchStates.has(curState)) {
+        const emb = buildFactionMemberStateEmbed(fName, uid, m, last.lastState, curState);
+        await notifyOwnerEmbed(emb);
+        console.log(`[faction] State: ${m.name} (${uid}) ${last.lastState} -> ${curState}`);
+      }
+      last.name = m.name;
+      last.lastState = curState;
+
+      // Offline > threshold alert (fire only once until they act again)
+      const tsLast = Number(m?.last_action?.timestamp || 0);
+      const wasTs = Number(last.lastActionTs || 0);
+      const isOfflineLong = tsLast > 0 && (nowSec - tsLast) >= offlineThresh;
+
+      if (offlineEnabled) {
+        if (isOfflineLong && !last.offlineNotified) {
+          const emb = buildFactionOfflineEmbed(fName, uid, m.name, tsLast, offlineHours);
+          await notifyOwnerEmbed(emb);
+          last.offlineNotified = true;
+          console.log(`[faction] Offline>=${offlineHours}h: ${m.name} (${uid})`);
+        }
+        // Reset the flag when they act again (timestamp increases)
+        if (!isOfflineLong && last.offlineNotified && tsLast > wasTs) {
+          last.offlineNotified = false;
+        }
+      }
+
+      last.lastActionTs = tsLast || last.lastActionTs;
+      prevMap[uid] = last;
+    }
+
+    store.faction.members = prevMap;
+    saveStoreDebounced('faction-poll');
+  } catch (e) {
+    const status = e?.response?.status;
+    if (status === 429) console.warn('[faction] 429 rate limited');
+    else console.warn('[faction] Error:', status || e.message);
+  }
 }
 
 // NEW: pre-alert evaluation
@@ -987,6 +1267,38 @@ const cmdWatch = base
     .setDescription('Show storage path & watcher count')
   );
 
+const cmdFaction = new SlashCommandBuilder()
+  .setName('faction')
+  .setDescription('Faction stalking settings')
+  .addSubcommand(sc => sc
+    .setName('setid')
+    .setDescription('Set faction ID and enable stalking')
+    .addIntegerOption(o => o.setName('id').setDescription('Faction ID').setRequired(true)))
+  .addSubcommand(sc => sc
+    .setName('enable')
+    .setDescription('Enable/disable faction stalking')
+    .addBooleanOption(o => o.setName('on').setDescription('true/false').setRequired(true)))
+  .addSubcommand(sc => sc
+    .setName('states')
+    .setDescription('Set which member states to alert on')
+    .addStringOption(o => o.setName('states').setDescription('Comma-separated or "all"').setRequired(true)))
+  .addSubcommand(sc => sc
+    .setName('interval')
+    .setDescription('Set faction polling interval (ms)')
+    .addIntegerOption(o => o.setName('ms').setDescription('>=10000').setRequired(true)))
+  .addSubcommand(sc => sc
+    .setName('offline')
+    .setDescription('Configure offline >N hours alert')
+    .addIntegerOption(o => o.setName('hours').setDescription('Hours threshold (default 24)').setRequired(false))
+    .addBooleanOption(o => o.setName('on').setDescription('Enable/disable alert').setRequired(false)))
+  .addSubcommand(sc => sc
+    .setName('daily')
+    .setDescription('Enable/disable daily respect digest at 00:00 UTC')
+    .addBooleanOption(o => o.setName('on').setDescription('true/false').setRequired(true)))
+  .addSubcommand(sc => sc
+    .setName('show')
+    .setDescription('Show faction stalking status'));
+
 const cmdEnergy = new SlashCommandBuilder().setName('energy').setDescription('Toggle Energy full alert').addBooleanOption(o => o.setName('on').setDescription('true/false'));
 const cmdNerve = new SlashCommandBuilder().setName('nerve').setDescription('Toggle Nerve full alert').addBooleanOption(o => o.setName('on').setDescription('true/false'));
 const cmdHappy = new SlashCommandBuilder().setName('happy').setDescription('Toggle Happy full alert').addBooleanOption(o => o.setName('on').setDescription('true/false'));
@@ -1014,7 +1326,8 @@ const commands = [
   cmdEnergy, cmdNerve, cmdHappy, cmdLife,
   cmdDrug, cmdMedical, cmdBooster,
   cmdChain,
-  cmdDelay
+  cmdDelay,
+  cmdFaction
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -1311,6 +1624,88 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
+    if (interaction.commandName === 'faction') {
+      const isEph = inGuildEphemeral(interaction);
+      try { await interaction.deferReply({ ephemeral: isEph }); } catch {}
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === 'setid') {
+        const id = String(interaction.options.getInteger('id'));
+        store.faction.id = id;
+        store.faction.enabled = true;
+        saveStoreDebounced('faction-setid');
+        restartFactionTimer();
+        restartFactionDailyTimer();
+        await interaction.editReply({ content: `Faction stalking enabled for ID ${id}.` });
+        return;
+      }
+
+      if (sub === 'enable') {
+        const on = interaction.options.getBoolean('on');
+        store.faction.enabled = !!on;
+        saveStoreDebounced('faction-enable');
+        restartFactionTimer();
+        restartFactionDailyTimer();
+        await interaction.editReply({ content: `Faction stalking: ${on ? 'ON' : 'OFF'}` });
+        return;
+      }
+
+      if (sub === 'states') {
+        const s = interaction.options.getString('states');
+        let list;
+        try { list = parseStatesInput(s); } catch (e) { await interaction.editReply({ content: e.message }); return; }
+        store.faction.states = list;
+        saveStoreDebounced('faction-states');
+        await interaction.editReply({ content: `Member state alerts -> ${list.join(', ')}` });
+        return;
+      }
+
+      if (sub === 'interval') {
+        const ms = interaction.options.getInteger('ms');
+        if (!Number.isFinite(ms) || ms < 10000) { await interaction.editReply({ content: 'Interval must be >= 10000 ms.' }); return; }
+        store.faction.requestMs = ms;
+        saveStoreDebounced('faction-interval');
+        restartFactionTimer();
+        await interaction.editReply({ content: `Faction polling interval set to ${ms} ms.` });
+        return;
+      }
+
+      if (sub === 'offline') {
+        const hours = interaction.options.getInteger('hours');
+        const on = interaction.options.getBoolean('on');
+        if (Number.isFinite(hours)) store.faction.offline.hours = Math.max(1, hours);
+        if (typeof on === 'boolean') store.faction.offline.enabled = on;
+        saveStoreDebounced('faction-offline');
+        await interaction.editReply({ content: `Offline alerts: ${store.faction.offline.enabled ? 'ON' : 'OFF'} • threshold=${store.faction.offline.hours}h` });
+        return;
+      }
+
+      if (sub === 'daily') {
+        const on = interaction.options.getBoolean('on');
+        store.faction.daily.enabled = !!on;
+        saveStoreDebounced('faction-daily');
+        restartFactionDailyTimer();
+        await interaction.editReply({ content: `Daily digest: ${on ? 'ON' : 'OFF'} (00:00 UTC)` });
+        return;
+      }
+
+      if (sub === 'show') {
+        const f = store.faction;
+        const lines = [
+          `ID: ${f.id || '(not set)'}`,
+          `Enabled: ${f.enabled ? 'yes' : 'no'}`,
+          `Interval: ${f.requestMs} ms`,
+          `States: ${f.states?.join(', ') || '(none)'}`,
+          `Offline: ${f.offline?.enabled !== false ? 'ON' : 'OFF'} (${f.offline?.hours || 24}h)`,
+          `Daily digest: ${f.daily?.enabled !== false ? 'ON' : 'OFF'}`,
+          `Members cached: ${Object.keys(f.members || {}).length}`,
+          `Respect: ${Number(f.lastRespect ?? 0).toLocaleString()}`
+        ];
+        await interaction.editReply({ content: lines.join('\n') });
+        return;
+      }
+    }
+
     // Bars toggles
     async function handleBarToggle(kind) {
       try { await interaction.deferReply({ ephemeral: isEph }); } catch {}
@@ -1430,6 +1825,9 @@ client.once('ready', async () => {
   restartBarsTimer();
   restartCooldownTimer();
   restartChainTimer();
+
+  restartFactionTimer();
+  restartFactionDailyTimer();
 
   console.log(`[watch] Watching ${pollOrder.length} user(s). States available: ${ALLOWED_STATES.join(', ')}`);
 });
