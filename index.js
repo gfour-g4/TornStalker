@@ -387,32 +387,46 @@ function parseTravelDirection(description) {
   if (/returning/.test(s) || /to\s+torn\s+from/.test(s) || /\bfrom\s+[a-z]/.test(s)) return 'return';
   return 'outbound';
 }
+function inferTravelTypeFromStatus(status) {
+  const t = (status?.travel_type || '').toLowerCase();
+  if (t) return t; // e.g. 'airstrip', 'private', 'standard', 'standard_economy', 'standard_business'
+  // Fallback heuristics if travel_type missing
+  const pit = (status?.plane_image_type || '').toLowerCase();
+  if (pit) {
+    if (/light|prop/.test(pit)) return 'airstrip';
+    if (/private|jet/.test(pit)) return 'private';
+  }
+  return 'standard';
+}
 function estimateTravelWindow(type, dest, startedAtMs) {
-  const pad = 0.05;
+  const PAD = 0.03; // ±3%
   const startedAtSec = Math.floor(startedAtMs / 1000);
 
   if (!dest) return { earliest: null, latest: null, ambiguous: false };
 
   const typeKey = (type || '').toLowerCase();
+
+  // Standard with unknown sub-class -> ambiguous between econ/business
   if (typeKey === 'standard') {
     const econ = TRAVEL_SECONDS.standard_economy[dest];
     const bus = TRAVEL_SECONDS.standard_business[dest];
     if (!econ || !bus) return { earliest: null, latest: null, ambiguous: false };
     const minSec = Math.min(econ, bus);
     const maxSec = Math.max(econ, bus);
-    const earliest = Math.floor(startedAtSec + minSec * (1 - pad));
-    const latest = Math.floor(startedAtSec + maxSec * (1 + pad));
+    const earliest = Math.floor(startedAtSec + minSec * (1 - PAD));
+    const latest = Math.floor(startedAtSec + maxSec * (1 + PAD));
     return { earliest, latest, ambiguous: true };
   }
 
+  // Exact maps
   const mapKey = ['airstrip', 'private', 'standard_economy', 'standard_business'].includes(typeKey) ? typeKey : null;
   if (!mapKey) return { earliest: null, latest: null, ambiguous: false };
 
   const sec = TRAVEL_SECONDS[mapKey]?.[dest];
   if (!sec) return { earliest: null, latest: null, ambiguous: false };
 
-  const earliest = Math.floor(startedAtSec + sec * (1 - pad));
-  const latest = Math.floor(startedAtSec + sec * (1 + pad));
+  const earliest = Math.floor(startedAtSec + sec * (1 - PAD));
+  const latest = Math.floor(startedAtSec + sec * (1 + PAD));
   return { earliest, latest, ambiguous: false };
 }
 const ts = (unix, style = 'f') => `<t:${unix}:${style}>`;
@@ -459,7 +473,7 @@ function buildStateEmbed({ userId, name, state, status, travel, titlePrefix = 'S
       lines.push(`• Travel type: ${typePretty}`);
 
       lines.push(`• ETA: ${center} (±${plusMinusMin}m)`);
-      lines.push(`• Window: ${windowShort} (±5%)`);
+      lines.push(`• Window: ${windowShort} (±3%)`);
     } else {
       const typePretty = (travel?.type || status?.travel_type || 'unknown').replace(/_/g, ' ');
       const dest = travel?.dest || parseDestination(status?.description) || null;
@@ -555,12 +569,12 @@ function buildFactionMemberStateEmbed(factionName, uid, member, oldState, newSta
       const mid = Math.floor((earliest + latest) / 2);
       const plusMinusMin = Math.max(1, Math.round((latest - earliest) / 120));
       const windowShort = `${ts(earliest, 't')}–${ts(latest, 't')}`;
-      const typePretty = (travel?.type || 'standard').replace(/_/g, ' ');
+      const typePretty = ((travel?.type) || (member?.status?.travel_type) || 'standard').replace(/_/g, ' ');
       const direction = travel?.direction === 'return' ? 'return' : 'outbound';
       if (travel?.dest) lines.push(`• Destination: ${direction === 'return' ? 'Torn (from ' + travel.dest + ')' : travel.dest}`);
       lines.push(`• Travel type: ${typePretty}`);
       lines.push(`• ETA: ${ts(mid, 'f')} (±${plusMinusMin}m)`);
-      lines.push(`• Window: ${windowShort} (±5%)`);
+      lines.push(`• Window: ${windowShort} (±3%)`);
     } else {
       if (descRaw) lines.push(`• ${descRaw}`);
       lines.push('• ETA: unknown');
@@ -1179,10 +1193,11 @@ async function pollNextFaction() {
           const dir = parseTravelDirection(desc);
           const dest = parseDestination(desc);
           const startedAt = Date.now();
-          const window = estimateTravelWindow('standard', dest, startedAt);
+          const t = inferTravelTypeFromStatus(m.status);
+          const window = estimateTravelWindow(t, dest, startedAt);
           prevMap[uid].travel = {
             startedAt,
-            type: 'standard',
+            type: t,
             dest: dest || null,
             earliest: window.earliest,
             latest: window.latest,
@@ -1225,10 +1240,11 @@ async function pollNextFaction() {
         if (!last.travel) {
           // start new session (baseline or missed change)
           const startedAt = Date.now();
-          const window = estimateTravelWindow('standard', dest, startedAt);
+          const t = inferTravelTypeFromStatus(m.status);
+          const window = estimateTravelWindow(t, dest, startedAt);
           last.travel = {
             startedAt,
-            type: 'standard',
+            type: t,
             dest: dest || null,
             earliest: window.earliest,
             latest: window.latest,
@@ -1241,10 +1257,11 @@ async function pollNextFaction() {
           const prevDest = last.travel.dest || null;
           if (dir !== prevDir || (dest || null) !== prevDest) {
             const startedAt = Date.now();
-            const window = estimateTravelWindow(last.travel.type || 'standard', dest, startedAt);
+            const t = inferTravelTypeFromStatus(m.status) || last.travel.type || 'standard';
+            const window = estimateTravelWindow(t, dest, startedAt);
             last.travel = {
               startedAt,
-              type: last.travel.type || 'standard',
+              type: t,
               dest: dest || null,
               earliest: window.earliest,
               latest: window.latest,
@@ -1259,7 +1276,8 @@ async function pollNextFaction() {
             }
           } else if ((!last.travel.dest && dest) || (!last.travel.earliest || !last.travel.latest)) {
             // enrich missing ETA when dest becomes known
-            const window = estimateTravelWindow(last.travel.type || 'standard', dest, last.travel.startedAt || Date.now());
+            const t = last.travel.type || inferTravelTypeFromStatus(m.status) || 'standard';
+            const window = estimateTravelWindow(t, dest, last.travel.startedAt || Date.now());
             last.travel.dest = dest || last.travel.dest || null;
             last.travel.earliest = window.earliest;
             last.travel.latest = window.latest;
