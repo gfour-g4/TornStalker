@@ -198,11 +198,57 @@ class TornAPI {
     this.v2 = axios.create({ baseURL: 'https://api.torn.com/v2', timeout: 12000 });
     this.v1 = axios.create({ baseURL: 'https://api.torn.com', timeout: 12000 });
   }
-  async getProfile(id) { const { data } = await this.v2.get(`/user/${id}/basic`, { params: { striptags: true, key: this.key } }); return data?.profile; }
-  async getBars() { const { data } = await this.v1.get('/user/', { params: { key: this.key, selections: 'bars' } }); return data; }
-  async getCooldowns() { const { data } = await this.v1.get('/user/', { params: { key: this.key, selections: 'cooldowns' } }); return data?.cooldowns; }
-  async getFaction(id) { const { data } = await this.v1.get(`/faction/${id}`, { params: { key: this.key, selections: 'basic' } }); return data; }
-  async searchUser(name) { const { data } = await this.v1.get('/user/', { params: { key: this.key, selections: 'search', name } }); return data; }
+
+  async getProfile(id) {
+    const { data } = await this.v2.get(`/user/${id}/basic`, { 
+      params: { striptags: true, key: this.key } 
+    });
+    
+    // CRITICAL: Validate response
+    if (!data?.profile) {
+      throw new Error(`Invalid profile response for ${id}`);
+    }
+    if (!data.profile.status || typeof data.profile.status.state !== 'string') {
+      throw new Error(`Missing status for ${id}`);
+    }
+    
+    return data.profile;
+  }
+
+  async getBars() {
+    const { data } = await this.v1.get('/user/', { 
+      params: { key: this.key, selections: 'bars' } 
+    });
+    if (!data) throw new Error('Invalid bars response');
+    return data;
+  }
+
+  async getCooldowns() {
+    const { data } = await this.v1.get('/user/', { 
+      params: { key: this.key, selections: 'cooldowns' } 
+    });
+    if (!data?.cooldowns) throw new Error('Invalid cooldowns response');
+    return data.cooldowns;
+  }
+
+  async getFaction(id) {
+    const { data } = await this.v1.get(`/faction/${id}`, { 
+      params: { key: this.key, selections: 'basic' } 
+    });
+    
+    // CRITICAL: Validate response
+    if (!data) {
+      throw new Error(`Invalid faction response for ${id}`);
+    }
+    if (!data.members || typeof data.members !== 'object') {
+      throw new Error(`Missing members for faction ${id}`);
+    }
+    if (Object.keys(data.members).length === 0) {
+      throw new Error(`Empty members for faction ${id} (API issue)`);
+    }
+    
+    return data;
+  }
 }
 
 const api = new TornAPI(CONFIG.torn.apiKey);
@@ -865,39 +911,40 @@ const pollUser = async (userId) => {
   try {
     profile = await api.getProfile(userId);
   } catch (e) {
-    console.warn(`[poll] Failed to fetch ${userId}:`, e?.response?.status || e.message);
+    // Don't process bad data - just skip this poll
+    console.warn(`[poll] Skipping ${cfg.name || userId}: ${e.message}`);
     return;
   }
 
-  const status = profile?.status || {};
-  const state = status.state || 'Okay';
+  const status = profile.status; // Guaranteed to exist due to validation
+  const state = status.state;   // Guaranteed to be a string
   const prev = cfg.lastState;
   
-  cfg.name = profile?.name || cfg.name;
+  cfg.name = profile.name || cfg.name;
 
-  // First poll - just set baseline
+  // First poll - baseline
   if (!prev) {
     cfg.lastState = state;
     cfg.travel = state === 'Traveling' ? createTravel(status) : null;
     store.save('baseline');
-    console.log(`[baseline] ${cfg.name} (${userId}): ${state}`);
+    console.log(`[baseline] ${cfg.name}: ${state}`);
     return;
   }
 
-  // Same state - just handle pre-alerts and travel updates
+  // Same state
   if (state === prev) {
-    // Pre-alerts for current state
+    // Pre-alerts
     cfg.preFired ??= {};
     await checkPreAlerts(userId, cfg.name, state, status, cfg.travel, cfg.preTimesSec, cfg.preFired,
       (name, id, st, endAt, left) => notify(Embeds.preAlert(name, id, st, endAt, left)));
     
-    // Travel direction/destination change while still traveling
+    // Travel updates
     if (state === 'Traveling' && cfg.travel) {
       const newDir = parseTravelDir(status.description);
       const newDest = parseDestination(status.description);
       if (newDir !== cfg.travel.direction || newDest !== cfg.travel.dest) {
         cfg.travel = createTravel(status);
-        store.save('travel-update');
+        store.save('travel');
         if (cfg.states?.includes('Traveling')) {
           await notify(Embeds.stateChange(userId, cfg.name, 'Traveling', 'Traveling', status, cfg.travel));
         }
@@ -906,29 +953,22 @@ const pollUser = async (userId) => {
     return;
   }
 
-  // STATE CHANGED - Update state FIRST before anything else (critical fix!)
+  // STATE CHANGED
+  console.log(`[state] ${cfg.name}: ${prev} → ${state}`);
+  
   const oldState = prev;
   cfg.lastState = state;
   cfg.travel = state === 'Traveling' ? createTravel(status) : null;
   
-  // Clear pre-fired for new session
   cfg.preFired ??= {};
   const key = sessionKey(state, status, cfg.travel);
   if (key) delete cfg.preFired[key];
   
-  // Save immediately so state is persisted even if alert fails
-  store.save('state-change');
+  store.save('state');
   
-  console.log(`[state] ${cfg.name} (${userId}): ${oldState} → ${state}`);
-  
-  // Now try to alert (failure won't affect state tracking)
   if (cfg.states?.includes(state)) {
-    try {
-      await notify(Embeds.stateChange(userId, cfg.name, oldState, state, status, cfg.travel), 
-        Components.quickActions(userId, state));
-    } catch (e) {
-      console.error(`[alert] Failed to notify for ${cfg.name}:`, e.message);
-    }
+    await notify(Embeds.stateChange(userId, cfg.name, oldState, state, status, cfg.travel),
+      Components.quickActions(userId, state));
   }
 };
 
@@ -941,7 +981,8 @@ const pollFaction = async (fid) => {
   try {
     data = await api.getFaction(fid);
   } catch (e) {
-    console.warn(`[faction] Failed to fetch ${fid}:`, e?.response?.status || e.message);
+    // Don't process bad data - skip this poll entirely
+    console.warn(`[faction] Skipping ${fconf.name || fid}: ${e.message}`);
     return;
   }
 
@@ -953,43 +994,67 @@ const pollFaction = async (fid) => {
   const prevStep = fconf.lastRespectStep ?? Math.floor((fconf.lastRespect || 0) / 100000);
   const stepNow = Math.floor(curRespect / 100000);
   if (stepNow > prevStep) {
-    try { await notify(Embeds.factionMilestone(fName, curRespect)); } catch {}
+    await notify(Embeds.factionMilestone(fName, curRespect));
   }
   Object.assign(fconf, { lastRespect: curRespect, lastRespectStep: stepNow });
 
   const prevMap = fconf.members ??= {};
-  const newMap = data.members || {};
+  const newMap = data.members; // Guaranteed non-empty by validation
   const watchStates = new Set(fconf.states || []);
   const offlineThresh = (fconf.offline?.hours || CONFIG.defaults.offlineHours) * 3600;
   const nowSec = Math.floor(Date.now() / 1000);
 
-  // Joins
-  for (const uid of Object.keys(newMap)) {
-    if (!prevMap[uid]) {
-      try { await notify(Embeds.factionJoinLeave('join', fName, uid, newMap[uid].name)); } catch {}
-      prevMap[uid] = { name: newMap[uid].name, lastState: newMap[uid].status?.state || 'Okay', preFired: {} };
+  const prevIds = new Set(Object.keys(prevMap));
+  const newIds = new Set(Object.keys(newMap));
+
+  // SAFETY CHECK: If >50% of members "left", something is wrong
+  if (prevIds.size > 10) {
+    const leftCount = [...prevIds].filter(id => !newIds.has(id)).length;
+    const leftPct = leftCount / prevIds.size;
+    if (leftPct > 0.5) {
+      console.warn(`[faction] ${fName}: ${leftCount}/${prevIds.size} (${Math.round(leftPct*100)}%) members "left" - likely API issue, skipping`);
+      return;
     }
   }
-  
-  // Leaves
-  for (const uid of Object.keys(prevMap)) {
-    if (!newMap[uid]) {
-      try { await notify(Embeds.factionJoinLeave('leave', fName, uid, prevMap[uid].name || uid)); } catch {}
+
+  // Joins - only for genuinely new members
+  for (const uid of newIds) {
+    if (!prevIds.has(uid)) {
+      const m = newMap[uid];
+      console.log(`[faction] ${fName}: ${m.name} joined`);
+      await notify(Embeds.factionJoinLeave('join', fName, uid, m.name));
+      prevMap[uid] = { 
+        name: m.name, 
+        lastState: m.status?.state || 'Okay', 
+        lastActionTs: m.last_action?.timestamp,
+        preFired: {},
+        travel: null
+      };
+    }
+  }
+
+  // Leaves - only for genuinely departed members  
+  for (const uid of prevIds) {
+    if (!newIds.has(uid)) {
+      const cached = prevMap[uid];
+      console.log(`[faction] ${fName}: ${cached?.name || uid} left`);
+      await notify(Embeds.factionJoinLeave('leave', fName, uid, cached?.name || uid));
       delete prevMap[uid];
     }
   }
 
-  // Member updates
+  // Member state updates
   for (const [uid, m] of Object.entries(newMap)) {
     const cached = prevMap[uid];
-    if (!cached) continue; // Just added above, skip
+    if (!cached) continue; // Just joined, already handled
     
     const curState = m.status?.state || 'Okay';
     const tsLast = Number(m.last_action?.timestamp || 0);
     const prevState = cached.lastState;
 
-    // Same state - handle travel updates and pre-alerts
+    // Same state
     if (curState === prevState) {
+      // Travel direction change
       if (curState === 'Traveling' && cached.travel) {
         const newDir = parseTravelDir(m.status?.description);
         const newDest = parseDestination(m.status?.description);
@@ -1003,25 +1068,19 @@ const pollFaction = async (fid) => {
       await checkPreAlerts(uid, m.name, curState, m.status, cached.travel, fconf.preTimesSec, cached.preFired,
         (name, id, st, endAt, left) => notify(Embeds.preAlert(`${name} (${fName})`, id, st, endAt, left)));
     } else {
-      // STATE CHANGED - Update FIRST
+      // State changed
+      console.log(`[faction] ${fName}: ${m.name} ${prevState} → ${curState}`);
+      
       const oldState = prevState;
       cached.lastState = curState;
       cached.travel = curState === 'Traveling' ? createTravel(m.status) : null;
       
-      // Clear pre-fired
       cached.preFired ??= {};
       const key = sessionKey(curState, m.status, cached.travel);
       if (key) delete cached.preFired[key];
       
-      console.log(`[faction] ${m.name} (${uid}): ${oldState} → ${curState}`);
-      
-      // Alert after state is saved
       if (watchStates.has(curState)) {
-        try {
-          await notify(Embeds.factionMemberChange(fName, uid, m, oldState, curState, cached.travel));
-        } catch (e) {
-          console.error(`[faction-alert] Failed:`, e.message);
-        }
+        await notify(Embeds.factionMemberChange(fName, uid, m, oldState, curState, cached.travel));
       }
     }
 
@@ -1029,7 +1088,7 @@ const pollFaction = async (fid) => {
     if (fconf.offline?.enabled !== false && tsLast > 0) {
       const isOffline = (nowSec - tsLast) >= offlineThresh;
       if (isOffline && !cached.offlineNotified) {
-        try { await notify(Embeds.factionOffline(fName, uid, m.name, tsLast, fconf.offline?.hours || CONFIG.defaults.offlineHours)); } catch {}
+        await notify(Embeds.factionOffline(fName, uid, m.name, tsLast, fconf.offline?.hours || CONFIG.defaults.offlineHours));
         cached.offlineNotified = true;
       } else if (!isOffline) {
         cached.offlineNotified = false;
@@ -1040,7 +1099,7 @@ const pollFaction = async (fid) => {
     cached.lastActionTs = tsLast || cached.lastActionTs;
   }
 
-  store.save('faction-poll');
+  store.save('faction');
 };
 
 // Self pollers (bars, cooldowns, chain)
