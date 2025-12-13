@@ -781,16 +781,46 @@ const Modals = {
 
 // ========= Pollers =========
 class Poller {
-  constructor(name) { this.name = name; this.items = []; this.index = 0; this.timer = null; this.ticking = false; }
-  refresh(items) { this.items = items; if (this.index >= items.length) this.index = 0; }
-  start(ms, fn) { this.stop(); if (!this.items.length) return; this.timer = setInterval(() => this.tick(fn), ms); this.tick(fn); }
-  stop() { clearInterval(this.timer); this.timer = null; }
+  constructor(name) { 
+    this.name = name; 
+    this.items = []; 
+    this.index = 0; 
+    this.timer = null; 
+    this.ticking = false; 
+  }
+  
+  refresh(items) { 
+    this.items = items; 
+    if (this.index >= items.length) this.index = 0; 
+  }
+  
+  start(ms, fn) { 
+    this.stop(); 
+    if (!this.items.length) return; 
+    this.timer = setInterval(() => this.tick(fn), ms); 
+    this.tick(fn); 
+  }
+  
+  stop() { 
+    clearInterval(this.timer); 
+    this.timer = null; 
+  }
+  
   async tick(fn) {
     if (this.ticking || !this.items.length) return;
     this.ticking = true;
-    try { await fn(this.items[this.index]); this.index = (this.index + 1) % this.items.length; }
-    catch (e) { console.warn(`[${this.name}]`, e?.response?.status === 429 ? 'Rate limited' : e.message); }
-    finally { this.ticking = false; }
+    
+    // Get item and update index BEFORE calling fn (matches original)
+    const item = this.items[this.index];
+    this.index = (this.index + 1) % this.items.length;
+    
+    try { 
+      await fn(item); 
+    } catch (e) { 
+      console.warn(`[${this.name}]`, e?.response?.status === 429 ? 'Rate limited' : e.message); 
+    } finally { 
+      this.ticking = false; 
+    }
   }
 }
 
@@ -831,53 +861,74 @@ const pollUser = async (userId) => {
   const cfg = store.watchers[userId];
   if (!cfg || cfg.enabled === false) return;
 
-  const profile = await api.getProfile(userId);
+  let profile;
+  try {
+    profile = await api.getProfile(userId);
+  } catch (e) {
+    console.warn(`[poll] Failed to fetch ${userId}:`, e?.response?.status || e.message);
+    return;
+  }
+
   const status = profile?.status || {};
   const state = status.state || 'Okay';
   const prev = cfg.lastState;
   
   cfg.name = profile?.name || cfg.name;
 
-  // Pre-alerts
-  cfg.preFired ??= {};
-  await checkPreAlerts(userId, cfg.name, state, status, cfg.travel, cfg.preTimesSec, cfg.preFired, 
-    (name, id, st, endAt, left) => notify(Embeds.preAlert(name, id, st, endAt, left)));
-
   // First poll - just set baseline
   if (!prev) {
     cfg.lastState = state;
     cfg.travel = state === 'Traveling' ? createTravel(status) : null;
     store.save('baseline');
+    console.log(`[baseline] ${cfg.name} (${userId}): ${state}`);
     return;
   }
 
-  // Travel direction change
-  if (state === 'Traveling' && prev === 'Traveling' && cfg.travel) {
-    const newDir = parseTravelDir(status.description);
-    const newDest = parseDestination(status.description);
-    if (newDir !== cfg.travel.direction || newDest !== cfg.travel.dest) {
-      cfg.travel = createTravel(status);
-      store.save('travel-update');
-      if (cfg.states?.includes('Traveling')) {
-        await notify(Embeds.stateChange(userId, cfg.name, 'Traveling', 'Traveling', status, cfg.travel));
+  // Same state - just handle pre-alerts and travel updates
+  if (state === prev) {
+    // Pre-alerts for current state
+    cfg.preFired ??= {};
+    await checkPreAlerts(userId, cfg.name, state, status, cfg.travel, cfg.preTimesSec, cfg.preFired,
+      (name, id, st, endAt, left) => notify(Embeds.preAlert(name, id, st, endAt, left)));
+    
+    // Travel direction/destination change while still traveling
+    if (state === 'Traveling' && cfg.travel) {
+      const newDir = parseTravelDir(status.description);
+      const newDest = parseDestination(status.description);
+      if (newDir !== cfg.travel.direction || newDest !== cfg.travel.dest) {
+        cfg.travel = createTravel(status);
+        store.save('travel-update');
+        if (cfg.states?.includes('Traveling')) {
+          await notify(Embeds.stateChange(userId, cfg.name, 'Traveling', 'Traveling', status, cfg.travel));
+        }
       }
     }
+    return;
   }
 
-  // State change
-  if (state !== prev) {
-    cfg.travel = state === 'Traveling' ? createTravel(status) : null;
-    
-    // Clear pre-fired for new session
-    const key = sessionKey(state, status, cfg.travel);
-    if (key) delete cfg.preFired[key];
-    
-    if (cfg.states?.includes(state)) {
-      await notify(Embeds.stateChange(userId, cfg.name, prev, state, status, cfg.travel), Components.quickActions(userId, state));
+  // STATE CHANGED - Update state FIRST before anything else (critical fix!)
+  const oldState = prev;
+  cfg.lastState = state;
+  cfg.travel = state === 'Traveling' ? createTravel(status) : null;
+  
+  // Clear pre-fired for new session
+  cfg.preFired ??= {};
+  const key = sessionKey(state, status, cfg.travel);
+  if (key) delete cfg.preFired[key];
+  
+  // Save immediately so state is persisted even if alert fails
+  store.save('state-change');
+  
+  console.log(`[state] ${cfg.name} (${userId}): ${oldState} → ${state}`);
+  
+  // Now try to alert (failure won't affect state tracking)
+  if (cfg.states?.includes(state)) {
+    try {
+      await notify(Embeds.stateChange(userId, cfg.name, oldState, state, status, cfg.travel), 
+        Components.quickActions(userId, state));
+    } catch (e) {
+      console.error(`[alert] Failed to notify for ${cfg.name}:`, e.message);
     }
-    
-    cfg.lastState = state;
-    store.save('state-change');
   }
 };
 
@@ -886,7 +937,14 @@ const pollFaction = async (fid) => {
   const fconf = store.factions.items[fid];
   if (!fconf || fconf.enabled === false) return;
 
-  const data = await api.getFaction(fid);
+  let data;
+  try {
+    data = await api.getFaction(fid);
+  } catch (e) {
+    console.warn(`[faction] Failed to fetch ${fid}:`, e?.response?.status || e.message);
+    return;
+  }
+
   const fName = data.name || `Faction ${fid}`;
   Object.assign(fconf, { name: data.name, tag: data.tag });
 
@@ -894,7 +952,9 @@ const pollFaction = async (fid) => {
   const curRespect = Number(data.respect || 0);
   const prevStep = fconf.lastRespectStep ?? Math.floor((fconf.lastRespect || 0) / 100000);
   const stepNow = Math.floor(curRespect / 100000);
-  if (stepNow > prevStep) await notify(Embeds.factionMilestone(fName, curRespect));
+  if (stepNow > prevStep) {
+    try { await notify(Embeds.factionMilestone(fName, curRespect)); } catch {}
+  }
   Object.assign(fconf, { lastRespect: curRespect, lastRespectStep: stepNow });
 
   const prevMap = fconf.members ??= {};
@@ -903,55 +963,81 @@ const pollFaction = async (fid) => {
   const offlineThresh = (fconf.offline?.hours || CONFIG.defaults.offlineHours) * 3600;
   const nowSec = Math.floor(Date.now() / 1000);
 
-  // Joins/Leaves
+  // Joins
   for (const uid of Object.keys(newMap)) {
     if (!prevMap[uid]) {
-      await notify(Embeds.factionJoinLeave('join', fName, uid, newMap[uid].name));
-      prevMap[uid] = { name: newMap[uid].name, lastState: newMap[uid].status?.state, preFired: {} };
+      try { await notify(Embeds.factionJoinLeave('join', fName, uid, newMap[uid].name)); } catch {}
+      prevMap[uid] = { name: newMap[uid].name, lastState: newMap[uid].status?.state || 'Okay', preFired: {} };
     }
   }
+  
+  // Leaves
   for (const uid of Object.keys(prevMap)) {
     if (!newMap[uid]) {
-      await notify(Embeds.factionJoinLeave('leave', fName, uid, prevMap[uid].name || uid));
+      try { await notify(Embeds.factionJoinLeave('leave', fName, uid, prevMap[uid].name || uid)); } catch {}
       delete prevMap[uid];
     }
   }
 
   // Member updates
   for (const [uid, m] of Object.entries(newMap)) {
-    const cached = prevMap[uid] ??= { name: m.name, lastState: null, preFired: {} };
+    const cached = prevMap[uid];
+    if (!cached) continue; // Just added above, skip
+    
     const curState = m.status?.state || 'Okay';
     const tsLast = Number(m.last_action?.timestamp || 0);
+    const prevState = cached.lastState;
 
-    // Travel
-    if (curState === 'Traveling') {
-      const newDir = parseTravelDir(m.status?.description), newDest = parseDestination(m.status?.description);
-      if (!cached.travel || newDir !== cached.travel.direction || newDest !== cached.travel.dest) {
-        cached.travel = createTravel(m.status);
+    // Same state - handle travel updates and pre-alerts
+    if (curState === prevState) {
+      if (curState === 'Traveling' && cached.travel) {
+        const newDir = parseTravelDir(m.status?.description);
+        const newDest = parseDestination(m.status?.description);
+        if (newDir !== cached.travel.direction || newDest !== cached.travel.dest) {
+          cached.travel = createTravel(m.status);
+        }
       }
+      
+      // Pre-alerts
+      cached.preFired ??= {};
+      await checkPreAlerts(uid, m.name, curState, m.status, cached.travel, fconf.preTimesSec, cached.preFired,
+        (name, id, st, endAt, left) => notify(Embeds.preAlert(`${name} (${fName})`, id, st, endAt, left)));
     } else {
-      cached.travel = null;
+      // STATE CHANGED - Update FIRST
+      const oldState = prevState;
+      cached.lastState = curState;
+      cached.travel = curState === 'Traveling' ? createTravel(m.status) : null;
+      
+      // Clear pre-fired
+      cached.preFired ??= {};
+      const key = sessionKey(curState, m.status, cached.travel);
+      if (key) delete cached.preFired[key];
+      
+      console.log(`[faction] ${m.name} (${uid}): ${oldState} → ${curState}`);
+      
+      // Alert after state is saved
+      if (watchStates.has(curState)) {
+        try {
+          await notify(Embeds.factionMemberChange(fName, uid, m, oldState, curState, cached.travel));
+        } catch (e) {
+          console.error(`[faction-alert] Failed:`, e.message);
+        }
+      }
     }
 
-    // State change
-    if (cached.lastState && curState !== cached.lastState && watchStates.has(curState)) {
-      await notify(Embeds.factionMemberChange(fName, uid, m, cached.lastState, curState, cached.travel));
+    // Offline check
+    if (fconf.offline?.enabled !== false && tsLast > 0) {
+      const isOffline = (nowSec - tsLast) >= offlineThresh;
+      if (isOffline && !cached.offlineNotified) {
+        try { await notify(Embeds.factionOffline(fName, uid, m.name, tsLast, fconf.offline?.hours || CONFIG.defaults.offlineHours)); } catch {}
+        cached.offlineNotified = true;
+      } else if (!isOffline) {
+        cached.offlineNotified = false;
+      }
     }
 
-    // Offline
-    if (fconf.offline?.enabled !== false && tsLast > 0 && (nowSec - tsLast) >= offlineThresh && !cached.offlineNotified) {
-      await notify(Embeds.factionOffline(fName, uid, m.name, tsLast, fconf.offline?.hours || CONFIG.defaults.offlineHours));
-      cached.offlineNotified = true;
-    } else if ((nowSec - tsLast) < offlineThresh) {
-      cached.offlineNotified = false;
-    }
-
-    // Pre-alerts
-    cached.preFired ??= {};
-    await checkPreAlerts(uid, m.name, curState, m.status, cached.travel, fconf.preTimesSec, cached.preFired,
-      (name, id, st, endAt, left) => notify(Embeds.preAlert(`${name} (${fName})`, id, st, endAt, left)));
-
-    Object.assign(cached, { name: m.name, lastState: curState, lastActionTs: tsLast || cached.lastActionTs });
+    cached.name = m.name;
+    cached.lastActionTs = tsLast || cached.lastActionTs;
   }
 
   store.save('faction-poll');
