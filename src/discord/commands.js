@@ -11,7 +11,7 @@ const commands = [
   
   new SlashCommandBuilder()
     .setName('alerts')
-    .setDescription('🔔 Configure personal bar/cooldown/chain alerts'),
+    .setDescription('🔔 Configure personal bar/cooldown/zchain alerts'),
   
   new SlashCommandBuilder()
     .setName('track')

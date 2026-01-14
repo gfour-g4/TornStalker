@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 
 const config = {
@@ -19,6 +18,8 @@ const config = {
     factionMs: Number(process.env.FACTION_INTERVAL_MS) || 30000,
     barsMs: 60000,
     chainMs: 10000,
+    iconsMs: 30000,    // Icons polling interval
+    companyMs: 60000,  // Company polling interval
   },
   
   persist: process.env.PERSIST_PATH || './data/store.json',
@@ -26,6 +27,7 @@ const config = {
   
   defaults: {
     offlineHours: Number(process.env.FACTION_OFFLINE_HOURS) || 24,
+    addictionThreshold: Number(process.env.ADDICTION_THRESHOLD) || -5,
   },
 };
 

@@ -1,0 +1,4185 @@
+================================================================================
+EXPORTED FILES FOR AI CHATBOT
+Export Date: 1/14/2026, 3:52:05 PM
+Total Files: 20
+================================================================================
+
+File: .env.example
+----------------------------------------
+DISCORD_TOKEN=your-discord-bot-token
+OWNER_DISCORD_ID=your-discord-user-id
+TORN_API_KEY=your-torn-api-key
+
+# Optional seed list if store.json is empty
+USER_IDS=2796054,436254
+
+# Default states to alert for new watchers (comma-separated, or "all")
+DEFAULT_STATES=Traveling,Jail,Hospital
+
+# Polling interval per-user (ms). One user per tick.
+REQUEST_INTERVAL_MS=5000
+
+# Keepalive for Render
+SELF_PING_URL=https://your-render-service.onrender.com/
+
+# Guild to instantly register commands (optional). Commands also work in DMs.
+GUILD_ID=your-guild-id
+
+# Local JSON persistence file
+PERSIST_PATH=./store.json
+
+================================================================================
+
+File: src/index.js
+----------------------------------------
+require('dotenv').config();
+
+const express = require('express');
+const { Client, GatewayIntentBits, Partials } = require('discord.js');
+
+const config = require('./config');
+const store = require('./services/store');
+const api = require('./services/api');
+const { setClient } = require('./services/notify');
+const { handleInteraction, setPollerStarter } = require('./discord/handlers');
+const commands = require('./discord/commands');
+const { startPollers, stopPollers, scheduleDailyDigest } = require('./pollers');
+const { createTravelInfo } = require('./utils/travel');
+const { sleep } = require('./utils/format');
+const { STATES } = require('./config/constants');
+
+// ═══════════════════════════════════════════════════════════════
+// EXPRESS SERVER
+// ═══════════════════════════════════════════════════════════════
+
+const app = express();
+
+app.get('/', (req, res) => res.send('Torn Tracker Online'));
+
+app.get('/healthz', (req, res) => {
+  const stats = store.getStats();
+  res.json({
+    ok: true,
+    uptime: process.uptime(),
+    stats,
+  });
+});
+
+app.get('/stats', (req, res) => {
+  res.json(store.getStats());
+});
+
+app.listen(config.port, () => {
+  console.log(`[web] Listening on port ${config.port}`);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// DISCORD CLIENT
+// ═══════════════════════════════════════════════════════════════
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.DirectMessages,
+  ],
+  partials: [Partials.Channel],
+});
+
+// Set client for notifications
+setClient(client);
+
+// Set poller starter for handlers
+setPollerStarter(startPollers);
+
+// Handle interactions
+client.on('interactionCreate', handleInteraction);
+
+// ═══════════════════════════════════════════════════════════════
+// STARTUP
+// ═══════════════════════════════════════════════════════════════
+
+async function initialize() {
+  // Load stored data
+  store.load();
+  
+  // Seed from environment if empty
+  seedFromEnv();
+  
+  // Validate API key
+  const keyCheck = await api.validateKey();
+  if (!keyCheck.valid) {
+    console.error('[api] Invalid API key:', keyCheck.error);
+    process.exit(1);
+  }
+  console.log(`[api] Connected as ${keyCheck.name} (Level ${keyCheck.level})`);
+}
+
+function seedFromEnv() {
+  // Seed users from env
+  if (!Object.keys(store.watchers).length && config.torn.userIds) {
+    const ids = config.torn.userIds.split(',').filter(Boolean);
+    
+    for (const id of ids) {
+      const trimmed = id.trim();
+      store.watchers[trimmed] = {
+        name: `User ${trimmed}`,
+        states: [...STATES],
+        enabled: true,
+        lastState: null,
+        preFired: {},
+      };
+    }
+    
+    if (ids.length) {
+      console.log(`[seed] Added ${ids.length} users from env`);
+      store.save('seed-users');
+    }
+  }
+  
+  // Seed factions from env
+  if (!Object.keys(store.factions.items).length && config.torn.factionIds) {
+    const ids = config.torn.factionIds.split(',').filter(Boolean);
+    
+    for (const id of ids) {
+      const trimmed = id.trim();
+      store.factions.items[trimmed] = {
+        id: trimmed,
+        name: `Faction ${trimmed}`,
+        states: [...STATES],
+        enabled: true,
+        members: {},
+        offline: { enabled: true, hours: config.defaults.offlineHours },
+        daily: { enabled: true },
+      };
+    }
+    
+    if (ids.length) {
+      console.log(`[seed] Added ${ids.length} factions from env`);
+      store.save('seed-factions');
+    }
+  }
+}
+
+async function primeBaselines() {
+  console.log('[prime] Establishing baselines...');
+  
+  for (const [id, cfg] of Object.entries(store.watchers)) {
+    if (cfg.lastState) continue;
+    
+    try {
+      const profile = await api.getProfile(id);
+      
+      cfg.name = profile.name;
+      cfg.lastState = profile.status?.state || 'Okay';
+      
+      if (profile.status?.state === 'Traveling') {
+        cfg.travel = createTravelInfo(profile.status);
+      }
+      
+      console.log(`[prime] ${cfg.name}: ${cfg.lastState}`);
+      await sleep(500);
+    } catch (error) {
+      console.warn(`[prime] Failed for ${id}: ${error.message}`);
+    }
+  }
+  
+  store.save('primed');
+}
+
+async function registerCommands() {
+  try {
+    // Guild commands (instant)
+    if (config.discord.guildId) {
+      const guild = await client.guilds.fetch(config.discord.guildId);
+      await guild.commands.set(commands);
+      console.log(`[cmd] Registered ${commands.length} guild commands`);
+    }
+    
+    // Global commands (may take up to an hour to propagate)
+    await client.application.commands.set(commands);
+    console.log(`[cmd] Registered ${commands.length} global commands`);
+  } catch (error) {
+    console.warn('[cmd] Failed to register commands:', error.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CLIENT READY
+// ═══════════════════════════════════════════════════════════════
+
+client.once('ready', async () => {
+  console.log(`[discord] Logged in as ${client.user.tag}`);
+  
+  await registerCommands();
+  await primeBaselines();
+  
+  // Start all pollers
+  startPollers();
+  
+  // Schedule daily faction digest
+  scheduleDailyDigest();
+  
+  // Status summary
+  const stats = store.getStats();
+  console.log(
+    `[ready] Tracking ${stats.users.active} users, ` +
+    `${stats.factions.active} factions (${stats.factions.members} members)`
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ERROR HANDLING
+// ═══════════════════════════════════════════════════════════════
+
+client.on('error', error => {
+  console.error('[discord] Error:', error.message);
+});
+
+process.on('unhandledRejection', error => {
+  console.error('[unhandled]', error);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GRACEFUL SHUTDOWN
+// ═══════════════════════════════════════════════════════════════
+
+async function shutdown(signal) {
+  console.log(`\n[${signal}] Shutting down...`);
+  
+  stopPollers();
+  store.saveSync();
+  
+  client.destroy();
+  
+  setTimeout(() => process.exit(0), 500);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// ═══════════════════════════════════════════════════════════════
+// START
+// ═══════════════════════════════════════════════════════════════
+
+(async () => {
+  try {
+    await initialize();
+    await client.login(config.discord.token);
+  } catch (error) {
+    console.error('[fatal]', error);
+    process.exit(1);
+  }
+})();
+
+================================================================================
+
+File: src/utils/format.js
+----------------------------------------
+
+
+const { STATES, EMOJI } = require('../config/constants');
+
+/**
+ * Capitalize first letter
+ */
+function capitalize(str) {
+  if (!str) return '';
+  return str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
+}
+
+/**
+ * Create visual progress bar
+ */
+function progressBar(current, max, length = 10, options = {}) {
+  const { 
+    filledChar = '█', 
+    emptyChar = '░',
+    showValues = true,
+    showPercent = false,
+  } = options;
+  
+  const pct = Math.max(0, Math.min(1, current / max));
+  const filled = Math.round(pct * length);
+  const bar = filledChar.repeat(filled) + emptyChar.repeat(length - filled);
+  
+  if (showPercent) {
+    return `${bar} ${Math.round(pct * 100)}%`;
+  }
+  
+  if (showValues) {
+    return `${bar} ${current.toLocaleString()}/${max.toLocaleString()}`;
+  }
+  
+  return bar;
+}
+
+/**
+ * Parse states from user input with fuzzy matching
+ */
+function parseStates(input) {
+  if (!input?.trim()) return [...STATES];
+  
+  const val = input.trim().toLowerCase();
+  
+  // Special values
+  if (['all', '*', 'any'].includes(val)) return [...STATES];
+  if (['none', '-', 'off', 'false', '0'].includes(val)) return [];
+  
+  const parsed = [];
+  const parts = input.split(/[,\s|]+/);
+  
+  for (const part of parts) {
+    const low = part.toLowerCase().trim();
+    if (!low) continue;
+    
+    const match = STATES.find(s => s.toLowerCase().startsWith(low));
+    if (!match) {
+      throw new Error(`Unknown state: "${part}". Valid: ${STATES.join(', ')}`);
+    }
+    
+    if (!parsed.includes(match)) {
+      parsed.push(match);
+    }
+  }
+  
+  return parsed;
+}
+
+/**
+ * Format states for display
+ */
+function formatStates(states, options = {}) {
+  const { useEmoji = true, separator = ' ' } = options;
+  
+  if (!states?.length) return '*none*';
+  
+  if (useEmoji) {
+    return states.map(s => EMOJI[s] || s).join(separator);
+  }
+  
+  return states.join(', ');
+}
+
+/**
+ * Clamp number between min and max
+ */
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+/**
+ * Format number with locale separators
+ */
+function formatNumber(num) {
+  return Number(num || 0).toLocaleString();
+}
+
+/**
+ * Truncate string to length
+ */
+function truncate(str, length, suffix = '...') {
+  if (!str || str.length <= length) return str;
+  return str.slice(0, length - suffix.length) + suffix;
+}
+
+/**
+ * Sleep for specified milliseconds
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Create unique session key for pre-alerts
+ */
+function sessionKey(state, status, travel) {
+  if (state === 'Traveling' && travel?.startedAt) {
+    return `T:${travel.direction}:${travel.startedAt}`;
+  }
+  if (['Jail', 'Hospital'].includes(state) && status?.until) {
+    return `${state[0]}:${status.until}`;
+  }
+  return null;
+}
+
+module.exports = {
+  capitalize,
+  progressBar,
+  parseStates,
+  formatStates,
+  clamp,
+  formatNumber,
+  truncate,
+  sleep,
+  sessionKey,
+  // Alias
+  cap: capitalize,
+};
+
+================================================================================
+
+File: src/utils/index.js
+----------------------------------------
+// Re-export all utilities
+module.exports = {
+    ...require('./time'),
+    ...require('./travel'),
+    ...require('./format'),
+  };
+
+================================================================================
+
+File: src/utils/time.js
+----------------------------------------
+/**
+ * Parse human-readable time string to seconds
+ * Supports: "5m", "1h30m", "90s", "2h", plain numbers
+ * @param {string|number} input - Time string or seconds
+ * @returns {number|null} Seconds or null if invalid
+ */
+function parseTime(input) {
+  if (input == null) return null;
+  
+  const str = String(input).toLowerCase().trim();
+  if (!str) return null;
+  
+  // Plain number = seconds
+  if (/^\d+$/.test(str)) {
+    return parseInt(str, 10);
+  }
+  
+  let total = 0;
+  const patterns = [
+    { regex: /(\d+(?:\.\d+)?)\s*h/i, multiplier: 3600 },
+    { regex: /(\d+(?:\.\d+)?)\s*m(?:in)?/i, multiplier: 60 },
+    { regex: /(\d+(?:\.\d+)?)\s*s(?:ec)?/i, multiplier: 1 },
+  ];
+  
+  for (const { regex, multiplier } of patterns) {
+    const match = str.match(regex);
+    if (match) {
+      total += parseFloat(match[1]) * multiplier;
+    }
+  }
+  
+  return total > 0 ? Math.floor(total) : null;
+}
+
+/**
+ * Format seconds to human-readable string
+ * @param {number} seconds - Duration in seconds
+ * @param {object} options - Formatting options
+ * @returns {string} Formatted time string
+ */
+function formatTime(seconds, options = {}) {
+  const { 
+    verbose = false, 
+    showSeconds = true,
+    maxParts = 3 
+  } = options;
+  
+  if (!seconds || seconds <= 0) return 'now';
+  
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  
+  const parts = [];
+  
+  if (h > 0) {
+    parts.push(verbose ? `${h} hour${h !== 1 ? 's' : ''}` : `${h}h`);
+  }
+  if (m > 0) {
+    parts.push(verbose ? `${m} minute${m !== 1 ? 's' : ''}` : `${m}m`);
+  }
+  if (s > 0 && showSeconds && (parts.length < maxParts || !h)) {
+    parts.push(verbose ? `${s} second${s !== 1 ? 's' : ''}` : `${s}s`);
+  }
+  
+  if (parts.length === 0) return 'now';
+  
+  return verbose ? parts.join(', ') : parts.join(' ');
+}
+
+/**
+ * Parse multiple time values from comma-separated string
+ * @param {string} input - Comma-separated times
+ * @returns {number[]} Array of seconds, sorted descending
+ */
+function parseTimes(input) {
+  if (!input) return [];
+  
+  const str = input.toLowerCase().trim();
+  if (['off', 'none', '-', 'disable', '0', 'false'].includes(str)) {
+    return [];
+  }
+  
+  const times = input
+    .split(/[,\s]+/)
+    .map(parseTime)
+    .filter(t => t != null && t > 0);
+  
+  // Remove duplicates and sort descending
+  return [...new Set(times)].sort((a, b) => b - a);
+}
+
+/**
+ * Create Discord timestamp
+ * @param {number} unix - Unix timestamp in seconds
+ * @param {string} style - Discord timestamp style
+ * @returns {string} Discord timestamp string
+ */
+function discordTimestamp(unix, style = 'f') {
+  return `<t:${Math.floor(unix)}:${style}>`;
+}
+
+/**
+ * Get relative time description
+ * @param {number} timestamp - Unix timestamp in seconds
+ * @returns {string} Relative time string
+ */
+function relativeTime(timestamp) {
+  const now = Math.floor(Date.now() / 1000);
+  const diff = timestamp - now;
+  
+  if (Math.abs(diff) < 60) return 'just now';
+  
+  const absDiff = Math.abs(diff);
+  const future = diff > 0;
+  
+  if (absDiff < 3600) {
+    const mins = Math.floor(absDiff / 60);
+    return future ? `in ${mins}m` : `${mins}m ago`;
+  }
+  
+  if (absDiff < 86400) {
+    const hours = Math.floor(absDiff / 3600);
+    return future ? `in ${hours}h` : `${hours}h ago`;
+  }
+  
+  const days = Math.floor(absDiff / 86400);
+  return future ? `in ${days}d` : `${days}d ago`;
+}
+
+module.exports = {
+  parseTime,
+  formatTime,
+  parseTimes,
+  discordTimestamp,
+  relativeTime,
+  // Aliases
+  humanTime: formatTime,
+  ts: discordTimestamp,
+};
+
+================================================================================
+
+File: src/utils/travel.js
+----------------------------------------
+const { DESTINATIONS, TRAVEL_TIMES } = require('../config/constants');
+
+const TRAVEL_PAD = 0.03; // 3% padding for estimation
+
+/**
+ * Get travel time for a destination and travel type
+ */
+function getTravelTime(type, destination) {
+  const idx = DESTINATIONS.findIndex(
+    d => d.toLowerCase() === destination?.toLowerCase()
+  );
+  return idx >= 0 ? TRAVEL_TIMES[type]?.[idx] : null;
+}
+
+/**
+ * Estimate arrival window for travel
+ */
+function estimateTravel(type, destination, startMs) {
+  const startSec = Math.floor(startMs / 1000);
+  
+  if (!destination) {
+    return { earliest: null, latest: null };
+  }
+  
+  // Standard class could be economy or business
+  if (type === 'standard') {
+    const econ = getTravelTime('standard_economy', destination);
+    const bus = getTravelTime('standard_business', destination);
+    
+    if (!econ || !bus) return { earliest: null, latest: null };
+    
+    return {
+      earliest: Math.floor(startSec + Math.min(econ, bus) * (1 - TRAVEL_PAD)),
+      latest: Math.floor(startSec + Math.max(econ, bus) * (1 + TRAVEL_PAD)),
+    };
+  }
+  
+  const sec = getTravelTime(type, destination);
+  if (!sec) return { earliest: null, latest: null };
+  
+  return {
+    earliest: Math.floor(startSec + sec * (1 - TRAVEL_PAD)),
+    latest: Math.floor(startSec + sec * (1 + TRAVEL_PAD)),
+  };
+}
+
+/**
+ * Parse destination from status description
+ */
+function parseDestination(description) {
+  if (!description) return null;
+  
+  // Match "Traveling to X" or "Returning from X"
+  const match = description.match(/(?:from|to)\s+([A-Za-z\s-]+)$/i);
+  if (!match) return null;
+  
+  const dest = match[1].replace(/[^\w\s-]/g, '').trim();
+  
+  // Try to find exact match in known destinations
+  const known = DESTINATIONS.find(
+    d => d.toLowerCase() === dest.toLowerCase()
+  );
+  
+  return known || dest;
+}
+
+/**
+ * Parse travel direction from status description
+ */
+function parseTravelDirection(description) {
+  if (!description) return 'outbound';
+  return /returning|from\s+\w/i.test(description) ? 'return' : 'outbound';
+}
+
+/**
+ * Infer travel type from status
+ */
+function inferTravelType(status) {
+  return status?.travel_type?.toLowerCase() || 'standard';
+}
+
+/**
+ * Create complete travel info from status
+ */
+function createTravelInfo(status) {
+  const description = status?.description || '';
+  const destination = parseDestination(description);
+  const type = inferTravelType(status);
+  const direction = parseTravelDirection(description);
+  const startedAt = Date.now();
+  
+  return {
+    startedAt,
+    type,
+    destination,
+    direction,
+    ...estimateTravel(type, destination, startedAt),
+  };
+}
+
+/**
+ * Format destination for display
+ */
+function formatDestination(travel) {
+  if (!travel?.destination) return 'Unknown';
+  
+  return travel.direction === 'return'
+    ? `← Returning from ${travel.destination}`
+    : `→ Flying to ${travel.destination}`;
+}
+
+/**
+ * Get ETA timestamp (midpoint of estimation window)
+ */
+function getETA(travel) {
+  if (!travel?.earliest || !travel?.latest) return null;
+  return Math.floor((travel.earliest + travel.latest) / 2);
+}
+
+module.exports = {
+  getTravelTime,
+  estimateTravel,
+  parseDestination,
+  parseTravelDirection,
+  inferTravelType,
+  createTravelInfo,
+  formatDestination,
+  getETA,
+  DESTINATIONS,
+};
+
+
+================================================================================
+
+File: src/services/api.js
+----------------------------------------
+const axios = require('axios');
+const config = require('../config');
+
+class TornAPI {
+  constructor(apiKey) {
+    this.key = apiKey;
+    this.requestCount = 0;
+    this.lastRequest = 0;
+    
+    // V2 API client
+    this.v2 = axios.create({
+      baseURL: 'https://api.torn.com/v2',
+      timeout: 15000,
+      params: { key: this.key, striptags: true },
+    });
+    
+    // V1 API client
+    this.v1 = axios.create({
+      baseURL: 'https://api.torn.com',
+      timeout: 15000,
+      params: { key: this.key },
+    });
+    
+    // Add response interceptors for error handling
+    const errorHandler = this._handleError.bind(this);
+    this.v1.interceptors.response.use(r => r, errorHandler);
+    this.v2.interceptors.response.use(r => r, errorHandler);
+  }
+
+  _handleError(error) {
+    if (error.response?.status === 429) {
+      console.warn('[api] Rate limited, backing off...');
+      throw new Error('Rate limited');
+    }
+    
+    const tornError = error.response?.data?.error;
+    if (tornError) {
+      throw new Error(`API Error ${tornError.code}: ${tornError.error}`);
+    }
+    
+    throw error;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // User Endpoints
+  // ─────────────────────────────────────────────────────────────
+
+  async getProfile(userId) {
+    const { data } = await this.v2.get(`/user/${userId}/basic`);
+    
+    if (!data?.profile) {
+      throw new Error(`Invalid profile response for ${userId}`);
+    }
+    
+    if (!data.profile.status?.state) {
+      throw new Error(`Missing status for ${userId}`);
+    }
+    
+    return data.profile;
+  }
+
+  async getBars() {
+    const { data } = await this.v1.get('/user/', {
+      params: { selections: 'bars' },
+    });
+    
+    if (!data) {
+      throw new Error('Invalid bars response');
+    }
+    
+    return data;
+  }
+
+  async getCooldowns() {
+    const { data } = await this.v1.get('/user/', {
+      params: { selections: 'cooldowns' },
+    });
+    
+    if (!data?.cooldowns) {
+      throw new Error('Invalid cooldowns response');
+    }
+    
+    return data.cooldowns;
+  }
+
+  async getChain() {
+    const { data } = await this.v1.get('/user/', {
+      params: { selections: 'bars' },
+    });
+    
+    return data?.chain || null;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Faction Endpoints
+  // ─────────────────────────────────────────────────────────────
+
+  async getFaction(factionId) {
+    const { data } = await this.v1.get(`/faction/${factionId}`, {
+      params: { selections: 'basic' },
+    });
+    
+    if (!data) {
+      throw new Error(`Invalid faction response for ${factionId}`);
+    }
+    
+    if (!data.members || typeof data.members !== 'object') {
+      throw new Error(`Missing members for faction ${factionId}`);
+    }
+    
+    if (Object.keys(data.members).length === 0) {
+      throw new Error(`Empty members for faction ${factionId}`);
+    }
+    
+    return data;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Utility
+  // ─────────────────────────────────────────────────────────────
+
+  async validateKey() {
+    try {
+      const { data } = await this.v1.get('/user/', {
+        params: { selections: 'basic' },
+      });
+      return { valid: true, name: data.name, level: data.level };
+    } catch (e) {
+      return { valid: false, error: e.message };
+    }
+  }
+}
+
+// Singleton instance
+const api = new TornAPI(config.torn.apiKey);
+
+module.exports = api;
+
+================================================================================
+
+File: src/services/notify.js
+----------------------------------------
+const config = require('../config');
+
+let discordClient = null;
+
+/**
+ * Set the Discord client for notifications
+ */
+function setClient(client) {
+  discordClient = client;
+}
+
+/**
+ * Send DM notification to owner
+ */
+async function notify(embeds, components = []) {
+  if (!discordClient) {
+    console.warn('[notify] Discord client not set');
+    return false;
+  }
+  
+  try {
+    const user = await discordClient.users.fetch(config.discord.ownerId);
+    
+    await user.send({
+      embeds: Array.isArray(embeds) ? embeds : [embeds],
+      components,
+    });
+    
+    return true;
+  } catch (e) {
+    console.error('[notify] Failed to send DM:', e.message);
+    return false;
+  }
+}
+
+/**
+ * Send notification with retry
+ */
+async function notifyWithRetry(embeds, components = [], maxRetries = 2) {
+  for (let i = 0; i <= maxRetries; i++) {
+    const success = await notify(embeds, components);
+    if (success) return true;
+    
+    if (i < maxRetries) {
+      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+    }
+  }
+  return false;
+}
+
+module.exports = {
+  setClient,
+  notify,
+  notifyWithRetry,
+};
+
+================================================================================
+
+File: src/services/store.js
+----------------------------------------
+const fs = require('fs');
+const path = require('path');
+const config = require('../config');
+const { STATES, BARS, COOLDOWNS } = require('../config/constants');
+
+class Store {
+  constructor(filePath) {
+    this.path = this._resolvePath(filePath);
+    this.data = this._defaultData();
+    this.saveTimer = null;
+    this.saveDelay = 300; // ms
+  }
+
+  _resolvePath(target) {
+    try {
+      const dir = path.dirname(target);
+      fs.mkdirSync(dir, { recursive: true });
+      
+      // Test write access
+      const probe = `${target}.probe`;
+      fs.writeFileSync(probe, '');
+      fs.unlinkSync(probe);
+      
+      return target;
+    } catch (e) {
+      console.warn(`[store] Cannot write to ${target}, using /tmp`);
+      return '/tmp/torn-tracker-store.json';
+    }
+  }
+
+  _defaultData() {
+    return {
+      version: 2,
+      requestMs: config.timing.requestMs,
+      watchers: {},
+      self: this._selfDefaults(),
+      factions: {
+        requestMs: config.timing.factionMs,
+        items: {},
+      },
+    };
+  }
+
+  _selfDefaults() {
+    return {
+      bars: {
+        ...Object.fromEntries(BARS.map(b => [b, false])),
+        last: {},
+        wasFull: {},
+      },
+      cooldowns: {
+        ...Object.fromEntries(COOLDOWNS.map(c => [c, false])),
+        last: {},
+      },
+      chain: {
+        enabled: false,
+        min: 10,
+        thresholds: [120, 60, 30],
+        last: {},
+        epochId: 0,
+        fired: {},
+      },
+    };
+  }
+
+  load() {
+    try {
+      if (!fs.existsSync(this.path)) {
+        console.log('[store] No existing data, starting fresh');
+        return;
+      }
+
+      const raw = fs.readFileSync(this.path, 'utf8').trim();
+      if (!raw) return;
+
+      const loaded = JSON.parse(raw);
+      
+      // Merge with defaults to ensure all fields exist
+      this.data = {
+        ...this._defaultData(),
+        ...loaded,
+        self: {
+          ...this._selfDefaults(),
+          ...loaded.self,
+          bars: {
+            ...this._selfDefaults().bars,
+            ...loaded.self?.bars,
+          },
+          cooldowns: {
+            ...this._selfDefaults().cooldowns,
+            ...loaded.self?.cooldowns,
+          },
+          chain: {
+            ...this._selfDefaults().chain,
+            ...loaded.self?.chain,
+          },
+        },
+        factions: {
+          requestMs: config.timing.factionMs,
+          items: {},
+          ...loaded.factions,
+        },
+      };
+
+      console.log(`[store] Loaded from ${this.path}`);
+    } catch (e) {
+      console.error('[store] Load failed:', e.message);
+    }
+  }
+
+  save(reason = '') {
+    clearTimeout(this.saveTimer);
+    
+    this.saveTimer = setTimeout(() => {
+      try {
+        const tmp = `${this.path}.tmp`;
+        const json = JSON.stringify(this.data, null, 2);
+        
+        fs.writeFileSync(tmp, json);
+        fs.renameSync(tmp, this.path);
+        
+        if (reason) {
+          console.log(`[store] Saved (${reason})`);
+        }
+      } catch (e) {
+        console.error('[store] Save failed:', e.message);
+      }
+    }, this.saveDelay);
+  }
+
+  saveSync() {
+    clearTimeout(this.saveTimer);
+    try {
+      fs.writeFileSync(this.path, JSON.stringify(this.data, null, 2));
+    } catch (e) {
+      console.error('[store] Sync save failed:', e.message);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Accessors
+  // ─────────────────────────────────────────────────────────────
+
+  get watchers() {
+    return this.data.watchers;
+  }
+
+  get self() {
+    return this.data.self;
+  }
+
+  get factions() {
+    return this.data.factions;
+  }
+
+  get requestMs() {
+    return this.data.requestMs;
+  }
+
+  set requestMs(value) {
+    this.data.requestMs = value;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // User Methods
+  // ─────────────────────────────────────────────────────────────
+
+  getUser(userId) {
+    return this.watchers[userId];
+  }
+
+  setUser(userId, data) {
+    this.watchers[userId] = data;
+    this.save('user-update');
+  }
+
+  removeUser(userId) {
+    delete this.watchers[userId];
+    this.save('user-remove');
+  }
+
+  getActiveUsers() {
+    return Object.entries(this.watchers)
+      .filter(([, cfg]) => cfg?.enabled !== false)
+      .map(([id]) => id);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Faction Methods
+  // ─────────────────────────────────────────────────────────────
+
+  getFaction(factionId) {
+    return this.factions.items[factionId];
+  }
+
+  setFaction(factionId, data) {
+    this.factions.items[factionId] = data;
+    this.save('faction-update');
+  }
+
+  removeFaction(factionId) {
+    delete this.factions.items[factionId];
+    this.save('faction-remove');
+  }
+
+  getActiveFactions() {
+    return Object.entries(this.factions.items)
+      .filter(([, f]) => f?.enabled !== false)
+      .map(([id]) => id);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Stats
+  // ─────────────────────────────────────────────────────────────
+
+  getStats() {
+    const users = Object.entries(this.watchers);
+    const factions = Object.entries(this.factions.items);
+    
+    return {
+      users: {
+        total: users.length,
+        active: users.filter(([, c]) => c?.enabled !== false).length,
+      },
+      factions: {
+        total: factions.length,
+        active: factions.filter(([, f]) => f?.enabled !== false).length,
+        members: factions.reduce(
+          (sum, [, f]) => sum + Object.keys(f?.members || {}).length,
+          0
+        ),
+      },
+      alerts: {
+        bars: BARS.filter(b => this.self.bars[b]).length,
+        cooldowns: COOLDOWNS.filter(c => this.self.cooldowns[c]).length,
+        chain: this.self.chain.enabled,
+      },
+    };
+  }
+}
+
+// Singleton instance
+const store = new Store(path.resolve(config.persist));
+
+module.exports = store;
+
+================================================================================
+
+File: src/pollers/faction.js
+----------------------------------------
+const config = require('../config');
+const store = require('../services/store');
+const api = require('../services/api');
+const { notify } = require('../services/notify');
+const Embeds = require('../discord/embeds');
+const { 
+  createTravelInfo, 
+  parseDestination, 
+  parseTravelDirection,
+} = require('../utils/travel');
+const { sessionKey } = require('../utils/format');
+const { checkPreAlerts } = require('./user');
+
+/**
+ * Poll a single faction
+ */
+async function pollFaction(factionId) {
+  const fconf = store.factions.items[factionId];
+  if (!fconf || fconf.enabled === false) return;
+  
+  let data;
+  try {
+    data = await api.getFaction(factionId);
+  } catch (error) {
+    console.warn(`[faction] Skipping ${fconf.name || factionId}: ${error.message}`);
+    return;
+  }
+  
+  const fName = data.name || `Faction ${factionId}`;
+  
+  // Update faction info
+  fconf.name = data.name;
+  fconf.tag = data.tag;
+  fconf.lastCheck = Date.now();
+  
+  // ─────────────────────────────────────────────────────────────
+  // Respect Milestones
+  // ─────────────────────────────────────────────────────────────
+  
+  const currentRespect = Number(data.respect || 0);
+  const prevStep = fconf.lastRespectStep ?? Math.floor((fconf.lastRespect || 0) / 100000);
+  const currentStep = Math.floor(currentRespect / 100000);
+  
+  if (currentStep > prevStep && prevStep > 0) {
+    await notify(Embeds.factionMilestone(fName, factionId, currentRespect));
+  }
+  
+  fconf.lastRespect = currentRespect;
+  fconf.lastRespectStep = currentStep;
+  
+  // ─────────────────────────────────────────────────────────────
+  // Member Tracking
+  // ─────────────────────────────────────────────────────────────
+  
+  const prevMembers = fconf.members || {};
+  const newMembers = data.members;
+  const watchStates = new Set(fconf.states || []);
+  const offlineThreshold = (fconf.offline?.hours || config.defaults.offlineHours) * 3600;
+  const nowSec = Math.floor(Date.now() / 1000);
+  
+  const prevIds = new Set(Object.keys(prevMembers));
+  const newIds = new Set(Object.keys(newMembers));
+  
+  // Safety check: If >50% of members "left", likely API issue
+  if (prevIds.size > 10) {
+    const leftCount = [...prevIds].filter(id => !newIds.has(id)).length;
+    const leftPct = leftCount / prevIds.size;
+    
+    if (leftPct > 0.5) {
+      console.warn(
+        `[faction] ${fName}: ${leftCount}/${prevIds.size} (${Math.round(leftPct * 100)}%) ` +
+        `members "left" - likely API issue, skipping`
+      );
+      return;
+    }
+  }
+  
+  // ─────────────────────────────────────────────────────────────
+  // Member Joins
+  // ─────────────────────────────────────────────────────────────
+  
+  for (const uid of newIds) {
+    if (!prevIds.has(uid)) {
+      const member = newMembers[uid];
+      console.log(`[faction] ${fName}: ${member.name} joined`);
+      
+      await notify(Embeds.factionJoinLeave('join', fName, factionId, uid, member.name));
+      
+      // Initialize cached member data
+      prevMembers[uid] = {
+        name: member.name,
+        lastState: member.status?.state || 'Okay',
+        lastActionTs: member.last_action?.timestamp,
+        preFired: {},
+        travel: null,
+      };
+    }
+  }
+  
+  // ─────────────────────────────────────────────────────────────
+  // Member Leaves
+  // ─────────────────────────────────────────────────────────────
+  
+  for (const uid of prevIds) {
+    if (!newIds.has(uid)) {
+      const cached = prevMembers[uid];
+      console.log(`[faction] ${fName}: ${cached?.name || uid} left`);
+      
+      await notify(Embeds.factionJoinLeave('leave', fName, factionId, uid, cached?.name || uid));
+      
+      delete prevMembers[uid];
+    }
+  }
+  
+  // ─────────────────────────────────────────────────────────────
+  // Member State Updates
+  // ─────────────────────────────────────────────────────────────
+  
+  for (const [uid, member] of Object.entries(newMembers)) {
+    const cached = prevMembers[uid];
+    if (!cached) continue; // Just joined, already handled
+    
+    const currentState = member.status?.state || 'Okay';
+    const lastActionTs = Number(member.last_action?.timestamp || 0);
+    const prevState = cached.lastState;
+    
+    // Same state
+    if (currentState === prevState) {
+      // Travel direction changes
+      if (currentState === 'Traveling' && cached.travel) {
+        const newDir = parseTravelDirection(member.status?.description);
+        const newDest = parseDestination(member.status?.description);
+        
+        if (newDir !== cached.travel.direction || newDest !== cached.travel.destination) {
+          cached.travel = createTravelInfo(member.status);
+        }
+      }
+      
+      // Pre-alerts for faction members
+      if (fconf.preTimesSec?.length) {
+        cached.preFired = cached.preFired || {};
+        await checkPreAlerts(
+          uid,
+          `${member.name} (${fName})`,
+          currentState,
+          member.status,
+          cached.travel,
+          fconf.preTimesSec,
+          cached.preFired
+        );
+      }
+    } else {
+      // State changed
+      console.log(`[faction] ${fName}: ${member.name} ${prevState} → ${currentState}`);
+      
+      const oldState = prevState;
+      cached.lastState = currentState;
+      cached.travel = currentState === 'Traveling' ? createTravelInfo(member.status) : null;
+      
+      // Reset pre-fired
+      cached.preFired = cached.preFired || {};
+      const key = sessionKey(currentState, member.status, cached.travel);
+      if (key) {
+        delete cached.preFired[key];
+      }
+      
+      // Notify if state is watched
+      if (watchStates.has(currentState)) {
+        await notify(
+          Embeds.factionMemberChange(fName, factionId, uid, member, oldState, currentState, cached.travel)
+        );
+      }
+    }
+    
+    // ─────────────────────────────────────────────────────────────
+    // Offline Check
+    // ─────────────────────────────────────────────────────────────
+    
+    if (fconf.offline?.enabled !== false && lastActionTs > 0) {
+      const isOffline = (nowSec - lastActionTs) >= offlineThreshold;
+      
+      if (isOffline && !cached.offlineNotified) {
+        await notify(
+          Embeds.factionOffline(
+            fName, 
+            factionId, 
+            uid, 
+            member.name, 
+            lastActionTs, 
+            fconf.offline?.hours || config.defaults.offlineHours
+          )
+        );
+        cached.offlineNotified = true;
+      } else if (!isOffline) {
+        cached.offlineNotified = false;
+      }
+    }
+    
+    // Update cached data
+    cached.name = member.name;
+    cached.lastActionTs = lastActionTs || cached.lastActionTs;
+  }
+  
+  // Update members reference
+  fconf.members = prevMembers;
+  store.save('faction');
+}
+
+module.exports = {
+  pollFaction,
+};
+
+================================================================================
+
+File: src/pollers/index.js
+----------------------------------------
+const config = require('../config');
+const store = require('../services/store');
+const { pollUser } = require('./user');
+const { pollFaction } = require('./faction');
+const { startSelfPollers, stopSelfPollers } = require('./self');
+
+// ═══════════════════════════════════════════════════════════════
+// POLLER CLASS
+// ═══════════════════════════════════════════════════════════════
+
+class Poller {
+  constructor(name) {
+    this.name = name;
+    this.items = [];
+    this.index = 0;
+    this.timer = null;
+    this.ticking = false;
+  }
+  
+  refresh(items) {
+    this.items = items;
+    if (this.index >= items.length) {
+      this.index = 0;
+    }
+  }
+  
+  start(intervalMs, pollFn) {
+    this.stop();
+    
+    if (!this.items.length) {
+      console.log(`[${this.name}] No items to poll`);
+      return;
+    }
+    
+    console.log(`[${this.name}] Starting with ${this.items.length} items @ ${intervalMs}ms`);
+    
+    this.timer = setInterval(() => this.tick(pollFn), intervalMs);
+    this.tick(pollFn); // Immediate first tick
+  }
+  
+  stop() {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+  
+  async tick(pollFn) {
+    if (this.ticking || !this.items.length) return;
+    
+    this.ticking = true;
+    const item = this.items[this.index];
+    this.index = (this.index + 1) % this.items.length;
+    
+    try {
+      await pollFn(item);
+    } catch (error) {
+      const msg = error?.response?.status === 429 
+        ? 'Rate limited' 
+        : error.message;
+      console.warn(`[${this.name}] ${item}: ${msg}`);
+    } finally {
+      this.ticking = false;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// POLLER INSTANCES
+// ═══════════════════════════════════════════════════════════════
+
+const userPoller = new Poller('users');
+const factionPoller = new Poller('factions');
+
+// ═══════════════════════════════════════════════════════════════
+// START/STOP ALL POLLERS
+// ═══════════════════════════════════════════════════════════════
+
+function startPollers() {
+  // User polling
+  const userIds = store.getActiveUsers();
+  userPoller.refresh(userIds);
+  userPoller.start(store.requestMs, pollUser);
+  
+  // Faction polling
+  const factionIds = store.getActiveFactions();
+  factionPoller.refresh(factionIds);
+  factionPoller.start(store.factions.requestMs, pollFaction);
+  
+  // Self polling (bars, cooldowns, chain)
+  startSelfPollers();
+}
+
+function stopPollers() {
+  userPoller.stop();
+  factionPoller.stop();
+  stopSelfPollers();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DAILY DIGEST
+// ═══════════════════════════════════════════════════════════════
+
+let dailyTimer = null;
+
+function scheduleDailyDigest() {
+  const now = new Date();
+  const next = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1,
+    0, 0, 5 // 00:00:05 UTC
+  ));
+  
+  const delay = next - now;
+  
+  clearTimeout(dailyTimer);
+  dailyTimer = setTimeout(runDailyDigest, delay);
+  
+  console.log(`[daily] Scheduled for ${next.toISOString()}`);
+}
+
+async function runDailyDigest() {
+  const api = require('../services/api');
+  const { notify } = require('../services/notify');
+  const Embeds = require('../discord/embeds');
+  const { sleep } = require('../utils');
+  
+  console.log('[daily] Running digest...');
+  
+  for (const [fid, f] of Object.entries(store.factions.items)) {
+    if (f.enabled === false || f.daily?.enabled === false) continue;
+    
+    try {
+      const data = await api.getFaction(fid);
+      const currentRespect = Number(data.respect || 0);
+      
+      f.daily = f.daily || {};
+      
+      if (f.daily.respectAtMidnight != null) {
+        const delta = currentRespect - f.daily.respectAtMidnight;
+        await notify(Embeds.factionDaily(data.name || fid, fid, delta, currentRespect));
+      }
+      
+      f.daily.respectAtMidnight = currentRespect;
+      store.save('daily');
+      
+      await sleep(1000);
+    } catch (error) {
+      console.warn(`[daily] ${fid}: ${error.message}`);
+    }
+  }
+  
+  // Schedule next
+  scheduleDailyDigest();
+}
+
+module.exports = {
+  Poller,
+  userPoller,
+  factionPoller,
+  startPollers,
+  stopPollers,
+  scheduleDailyDigest,
+};
+
+================================================================================
+
+File: src/pollers/self.js
+----------------------------------------
+const store = require('../services/store');
+const api = require('../services/api');
+const { notify } = require('../services/notify');
+const Embeds = require('../discord/embeds');
+const { BARS, COOLDOWNS } = require('../config/constants');
+const config = require('../config');
+
+let barsTimer = null;
+let chainTimer = null;
+let cooldownTimer = null;
+
+// ═══════════════════════════════════════════════════════════════
+// BAR POLLING
+// ═══════════════════════════════════════════════════════════════
+
+async function pollBars() {
+  try {
+    const data = await api.getBars();
+    const { self } = store.data;
+    
+    for (const bar of BARS) {
+      if (!self.bars[bar]) continue;
+      
+      const current = data[bar];
+      if (!current) continue;
+      
+      const isFull = current.current >= current.maximum;
+      
+      // Alert if just became full
+      if (isFull && !self.bars.wasFull[bar]) {
+        await notify(Embeds.barFull(bar, current));
+      }
+      
+      self.bars.wasFull[bar] = isFull;
+      self.bars.last[bar] = current;
+    }
+    
+    // Also update chain data
+    if (data.chain) {
+      self.chain.last = {
+        ...data.chain,
+        updatedAt: Date.now(),
+      };
+    }
+    
+    store.save('bars');
+  } catch (error) {
+    console.warn('[bars]', error.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CHAIN POLLING
+// ═══════════════════════════════════════════════════════════════
+
+async function pollChain() {
+  try {
+    const data = await api.getBars();
+    const chain = data.chain;
+    
+    if (!chain) return;
+    
+    const { self } = store.data;
+    const prevCount = self.chain.last?.current ?? 0;
+    const currentCount = chain.current ?? 0;
+    
+    // Detect new chain epoch (chain reset or started)
+    if (currentCount < prevCount || (prevCount === 0 && currentCount > 0)) {
+      self.chain.epochId = (self.chain.epochId || 0) + 1;
+      self.chain.fired[self.chain.epochId] = [];
+    }
+    
+    self.chain.last = {
+      ...chain,
+      updatedAt: Date.now(),
+    };
+    
+    // Check if we should alert
+    if (!self.chain.enabled) return;
+    if (currentCount < (self.chain.min || 10)) return;
+    
+    const epochFired = self.chain.fired[self.chain.epochId] || [];
+    self.chain.fired[self.chain.epochId] = epochFired;
+    
+    const thresholds = (self.chain.thresholds || [120, 60, 30]).sort((a, b) => b - a);
+    
+    for (const threshold of thresholds) {
+      if (!epochFired.includes(threshold) && chain.timeout <= threshold && chain.timeout >= 0) {
+        epochFired.push(threshold);
+        await notify(Embeds.chainAlert(chain, threshold));
+      }
+    }
+    
+    store.save('chain');
+  } catch (error) {
+    console.warn('[chain]', error.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// COOLDOWN POLLING
+// ═══════════════════════════════════════════════════════════════
+
+async function pollCooldowns() {
+  try {
+    const cooldowns = await api.getCooldowns();
+    const { self } = store.data;
+    
+    let soonestExpiry = Infinity;
+    
+    for (const cd of COOLDOWNS) {
+      if (!self.cooldowns[cd]) continue;
+      
+      const prev = self.cooldowns.last[cd] || 0;
+      const current = cooldowns[cd] ?? 0;
+      
+      self.cooldowns.last[cd] = current;
+      
+      // Alert if just became ready (was >0, now 0)
+      if (prev > 0 && current <= 0) {
+        await notify(Embeds.cooldownReady(cd));
+      }
+      
+      // Track soonest expiry for smart scheduling
+      if (current > 0) {
+        soonestExpiry = Math.min(soonestExpiry, current);
+      }
+    }
+    
+    store.save('cooldowns');
+    
+    // Schedule next poll based on soonest expiry
+    const nextPoll = soonestExpiry < Infinity 
+      ? (soonestExpiry + 2) * 1000  // 2 second buffer
+      : 30 * 60 * 1000;             // 30 minutes default
+    
+    scheduleCooldownPoll(nextPoll);
+    
+  } catch (error) {
+    console.warn('[cooldowns]', error.message);
+    // Retry in 5 minutes on error
+    scheduleCooldownPoll(5 * 60 * 1000);
+  }
+}
+
+function scheduleCooldownPoll(ms) {
+  clearTimeout(cooldownTimer);
+  
+  const hasActiveCooldowns = COOLDOWNS.some(c => store.self.cooldowns[c]);
+  if (!hasActiveCooldowns) return;
+  
+  cooldownTimer = setTimeout(pollCooldowns, Math.max(2000, ms));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// START/STOP
+// ═══════════════════════════════════════════════════════════════
+
+function startSelfPollers() {
+  stopSelfPollers();
+  
+  const { self } = store.data;
+  const hasBars = BARS.some(b => self.bars[b]);
+  const hasChain = self.chain.enabled;
+  const hasCooldowns = COOLDOWNS.some(c => self.cooldowns[c]);
+  
+  // Bars polling
+  if (hasBars || hasChain) {
+    console.log('[self] Starting bars polling');
+    barsTimer = setInterval(pollBars, config.timing.barsMs);
+    pollBars();
+  }
+  
+  // Chain polling (more frequent)
+  if (hasChain) {
+    console.log('[self] Starting chain polling');
+    chainTimer = setInterval(pollChain, config.timing.chainMs);
+  }
+  
+  // Cooldowns polling (smart scheduling)
+  if (hasCooldowns) {
+    console.log('[self] Starting cooldowns polling');
+    pollCooldowns();
+  }
+}
+
+function stopSelfPollers() {
+  clearInterval(barsTimer);
+  clearInterval(chainTimer);
+  clearTimeout(cooldownTimer);
+  
+  barsTimer = null;
+  chainTimer = null;
+  cooldownTimer = null;
+}
+
+module.exports = {
+  pollBars,
+  pollChain,
+  pollCooldowns,
+  startSelfPollers,
+  stopSelfPollers,
+};
+
+================================================================================
+
+File: src/pollers/user.js
+----------------------------------------
+const store = require('../services/store');
+const api = require('../services/api');
+const { notify } = require('../services/notify');
+const Embeds = require('../discord/embeds');
+const Components = require('../discord/components');
+const { 
+  createTravelInfo, 
+  parseDestination, 
+  parseTravelDirection,
+} = require('../utils/travel');
+const { sessionKey } = require('../utils/format');
+
+/**
+ * Check and fire pre-alerts for a user
+ */
+async function checkPreAlerts(userId, name, state, status, travel, preTimesSec, preFired) {
+  if (!preTimesSec?.length) return;
+  
+  // Determine end time
+  let endAt = null;
+  if (state === 'Traveling' && travel?.earliest) {
+    endAt = travel.earliest;
+  } else if (['Jail', 'Hospital'].includes(state) && status?.until) {
+    endAt = Number(status.until);
+  }
+  
+  if (!endAt) return;
+  
+  const nowSec = Math.floor(Date.now() / 1000);
+  const left = endAt - nowSec;
+  
+  if (left <= 0) return;
+  
+  const key = sessionKey(state, status, travel);
+  if (!key) return;
+  
+  preFired[key] = preFired[key] || [];
+  
+  for (const threshold of preTimesSec) {
+    if (left <= threshold && !preFired[key].includes(threshold)) {
+      preFired[key].push(threshold);
+      await notify(Embeds.preAlert(name, userId, state, endAt, left));
+    }
+  }
+}
+
+/**
+ * Poll a single user
+ */
+async function pollUser(userId) {
+  const cfg = store.watchers[userId];
+  if (!cfg || cfg.enabled === false) return;
+  
+  let profile;
+  try {
+    profile = await api.getProfile(userId);
+  } catch (error) {
+    console.warn(`[user] Skipping ${cfg.name || userId}: ${error.message}`);
+    return;
+  }
+  
+  const status = profile.status;
+  const state = status.state;
+  const prevState = cfg.lastState;
+  
+  // Update name
+  cfg.name = profile.name || cfg.name;
+  cfg.lastCheck = Date.now();
+  
+  // First poll - establish baseline
+  if (!prevState) {
+    cfg.lastState = state;
+    cfg.travel = state === 'Traveling' ? createTravelInfo(status) : null;
+    store.save('baseline');
+    console.log(`[user] Baseline: ${cfg.name} = ${state}`);
+    return;
+  }
+  
+  // Same state
+  if (state === prevState) {
+    // Pre-alerts
+    cfg.preFired = cfg.preFired || {};
+    await checkPreAlerts(
+      userId, 
+      cfg.name, 
+      state, 
+      status, 
+      cfg.travel, 
+      cfg.preTimesSec, 
+      cfg.preFired
+    );
+    
+    // Travel direction/destination changes
+    if (state === 'Traveling' && cfg.travel) {
+      const newDir = parseTravelDirection(status.description);
+      const newDest = parseDestination(status.description);
+      
+      if (newDir !== cfg.travel.direction || newDest !== cfg.travel.destination) {
+        cfg.travel = createTravelInfo(status);
+        store.save('travel-update');
+        
+        if (cfg.states?.includes('Traveling')) {
+          await notify(
+            Embeds.stateChange(userId, cfg.name, 'Traveling', 'Traveling', status, cfg.travel)
+          );
+        }
+      }
+    }
+    
+    return;
+  }
+  
+  // STATE CHANGED
+  console.log(`[user] ${cfg.name}: ${prevState} → ${state}`);
+  
+  const oldState = prevState;
+  cfg.lastState = state;
+  cfg.travel = state === 'Traveling' ? createTravelInfo(status) : null;
+  
+  // Reset pre-fired alerts for new session
+  cfg.preFired = cfg.preFired || {};
+  const key = sessionKey(state, status, cfg.travel);
+  if (key) {
+    delete cfg.preFired[key];
+  }
+  
+  store.save('state-change');
+  
+  // Send notification if this state is tracked
+  if (cfg.states?.includes(state)) {
+    await notify(
+      Embeds.stateChange(userId, cfg.name, oldState, state, status, cfg.travel),
+      Components.quickActions(userId, state)
+    );
+  }
+}
+
+module.exports = {
+  pollUser,
+  checkPreAlerts,
+};
+
+================================================================================
+
+File: src/discord/commands.js
+----------------------------------------
+const { SlashCommandBuilder } = require('discord.js');
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName('dashboard')
+    .setDescription('📊 Open the main control panel'),
+  
+  new SlashCommandBuilder()
+    .setName('help')
+    .setDescription('📖 Show help and commands'),
+  
+  new SlashCommandBuilder()
+    .setName('alerts')
+    .setDescription('🔔 Configure personal bar/cooldown/zchain alerts'),
+  
+  new SlashCommandBuilder()
+    .setName('track')
+    .setDescription('👁️ Start tracking a user or faction')
+    .addSubcommand(sub =>
+      sub
+        .setName('user')
+        .setDescription('Track a Torn user')
+        .addIntegerOption(opt =>
+          opt
+            .setName('id')
+            .setDescription('Torn user ID')
+            .setRequired(true),
+        )
+        .addStringOption(opt =>
+          opt
+            .setName('alerts')
+            .setDescription('States to alert on (e.g., "jail, hospital" or "all")'),
+        )
+        .addStringOption(opt =>
+          opt
+            .setName('warn')
+            .setDescription('Early warnings (e.g., "5m, 2m")'),
+        ),
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName('faction')
+        .setDescription('Track a faction')
+        .addIntegerOption(opt =>
+          opt
+            .setName('id')
+            .setDescription('Faction ID')
+            .setRequired(true),
+        )
+        .addStringOption(opt =>
+          opt
+            .setName('alerts')
+            .setDescription('States to alert on'),
+        )
+        .addStringOption(opt =>
+          opt
+            .setName('warn')
+            .setDescription('Early warnings'),
+        )
+        .addIntegerOption(opt =>
+          opt
+            .setName('offline')
+            .setDescription('Offline alert hours (default: 24)'),
+        ),
+    ),
+  
+  new SlashCommandBuilder()
+    .setName('status')
+    .setDescription('👁️ Check current status of a user or faction')
+    .addIntegerOption(opt =>
+      opt
+        .setName('id')
+        .setDescription('User or faction ID')
+        .setRequired(true),
+    ),
+  
+  new SlashCommandBuilder()
+    .setName('remove')
+    .setDescription('🗑️ Stop tracking a user or faction')
+    .addIntegerOption(opt =>
+      opt
+        .setName('id')
+        .setDescription('User or faction ID')
+        .setRequired(true),
+    ),
+  
+  new SlashCommandBuilder()
+    .setName('delay')
+    .setDescription('⏱️ Add delay to travel ETA')
+    .addIntegerOption(opt =>
+      opt
+        .setName('id')
+        .setDescription('User ID')
+        .setRequired(true),
+    )
+    .addStringOption(opt =>
+      opt
+        .setName('time')
+        .setDescription('Delay time (e.g., "5m")')
+        .setRequired(true),
+    ),
+];
+
+module.exports = commands.map(c => c.toJSON());
+
+
+================================================================================
+
+File: src/discord/components.js
+----------------------------------------
+const {
+    ActionRowBuilder,
+    StringSelectMenuBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+  } = require('discord.js');
+  const store = require('../services/store');
+  const { STATES, BARS, COOLDOWNS, EMOJI, LINKS } = require('../config/constants');
+  const { capitalize } = require('../utils');
+  
+  // ═══════════════════════════════════════════════════════════════
+  // DASHBOARD
+  // ═══════════════════════════════════════════════════════════════
+  
+  function dashboardButtons() {
+    return [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('dash:users')
+          .setLabel('Users')
+          .setEmoji('👤')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId('dash:factions')
+          .setLabel('Factions')
+          .setEmoji('🏴')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId('dash:alerts')
+          .setLabel('Personal Alerts')
+          .setEmoji('🔔')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId('dash:refresh')
+          .setLabel('Refresh')
+          .setEmoji('🔄')
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ];
+  }
+  
+  // ═══════════════════════════════════════════════════════════════
+  // USER LIST
+  // ═══════════════════════════════════════════════════════════════
+  
+  function userListMenu() {
+    const entries = Object.entries(store.watchers).slice(0, 25);
+    
+    const rows = [];
+    
+    if (entries.length) {
+      rows.push(
+        new ActionRowBuilder().addComponents(
+          new StringSelectMenuBuilder()
+            .setCustomId('select:user')
+            .setPlaceholder('Select a user to configure...')
+            .addOptions(entries.map(([id, cfg]) => ({
+              label: cfg.name || `User ${id}`,
+              description: `${cfg.enabled === false ? 'Paused' : 'Active'} • ${cfg.lastState || 'Unknown'}`,
+              value: id,
+              emoji: cfg.enabled === false ? EMOJI.off : EMOJI.on,
+            }))),
+        ),
+      );
+    }
+    
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('dash:main')
+          .setLabel('Back')
+          .setEmoji('◀️')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId('modal:adduser')
+          .setLabel('Add User')
+          .setEmoji('➕')
+          .setStyle(ButtonStyle.Success),
+      ),
+    );
+    
+    return rows;
+  }
+  
+  // ═══════════════════════════════════════════════════════════════
+  // FACTION LIST
+  // ═══════════════════════════════════════════════════════════════
+  
+  function factionListMenu() {
+    const entries = Object.entries(store.factions.items).slice(0, 25);
+    
+    const rows = [];
+    
+    if (entries.length) {
+      rows.push(
+        new ActionRowBuilder().addComponents(
+          new StringSelectMenuBuilder()
+            .setCustomId('select:faction')
+            .setPlaceholder('Select a faction to configure...')
+            .addOptions(entries.map(([id, f]) => ({
+              label: f.name || `Faction ${id}`,
+              description: `${Object.keys(f.members || {}).length} members`,
+              value: id,
+              emoji: f.enabled === false ? EMOJI.off : EMOJI.on,
+            }))),
+        ),
+      );
+    }
+    
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('dash:main')
+          .setLabel('Back')
+          .setEmoji('◀️')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId('modal:addfaction')
+          .setLabel('Add Faction')
+          .setEmoji('➕')
+          .setStyle(ButtonStyle.Success),
+      ),
+    );
+    
+    return rows;
+  }
+  
+  // ═══════════════════════════════════════════════════════════════
+  // ALERTS CONFIG
+  // ═══════════════════════════════════════════════════════════════
+  
+  function alertsButtons() {
+    const { self } = store.data;
+    
+    const barRow = new ActionRowBuilder().addComponents(
+      ...BARS.map(b =>
+        new ButtonBuilder()
+          .setCustomId(`toggle:bar:${b}`)
+          .setLabel(capitalize(b))
+          .setEmoji(EMOJI[b])
+          .setStyle(self.bars[b] ? ButtonStyle.Success : ButtonStyle.Secondary),
+      ),
+    );
+    
+    const cdRow = new ActionRowBuilder().addComponents(
+      ...COOLDOWNS.map(c =>
+        new ButtonBuilder()
+          .setCustomId(`toggle:cd:${c}`)
+          .setLabel(capitalize(c))
+          .setEmoji(EMOJI[c])
+          .setStyle(self.cooldowns[c] ? ButtonStyle.Success : ButtonStyle.Secondary),
+      ),
+    );
+    
+    const chainRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('toggle:chain')
+        .setLabel('Chain Alerts')
+        .setEmoji(EMOJI.chain)
+        .setStyle(self.chain.enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('modal:chain')
+        .setLabel('Configure')
+        .setEmoji('⚙️')
+        .setStyle(ButtonStyle.Primary),
+    );
+    
+    const navRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('dash:main')
+        .setLabel('Back')
+        .setEmoji('◀️')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('alerts:refresh')
+        .setLabel('Refresh Data')
+        .setEmoji('🔄')
+        .setStyle(ButtonStyle.Primary),
+    );
+    
+    return [barRow, cdRow, chainRow, navRow];
+  }
+  
+  // ═══════════════════════════════════════════════════════════════
+  // USER CONFIG
+  // ═══════════════════════════════════════════════════════════════
+  
+  function userConfig(userId) {
+    const cfg = store.watchers[userId];
+    if (!cfg) return [];
+    
+    const stateRow = new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`states:${userId}`)
+        .setPlaceholder('Select alert states...')
+        .setMinValues(0)
+        .setMaxValues(STATES.length)
+        .addOptions(STATES.map(s => ({
+          label: s,
+          value: s,
+          emoji: EMOJI[s],
+          default: cfg.states?.includes(s),
+        }))),
+    );
+    
+    const actionRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`toggle:user:${userId}`)
+        .setLabel(cfg.enabled === false ? 'Enable' : 'Pause')
+        .setStyle(cfg.enabled === false ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`modal:userwarn:${userId}`)
+        .setLabel('Warnings')
+        .setEmoji('⏰')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`refresh:user:${userId}`)
+        .setLabel('Refresh')
+        .setEmoji('🔄')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`remove:user:${userId}`)
+        .setLabel('Remove')
+        .setStyle(ButtonStyle.Danger),
+    );
+    
+    const navRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('dash:users')
+        .setLabel('Back')
+        .setEmoji('◀️')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setURL(LINKS.profile(userId))
+        .setLabel('Torn Profile')
+        .setStyle(ButtonStyle.Link),
+      new ButtonBuilder()
+        .setURL(LINKS.attack(userId))
+        .setLabel('Attack')
+        .setStyle(ButtonStyle.Link),
+    );
+    
+    return [stateRow, actionRow, navRow];
+  }
+  
+  // ═══════════════════════════════════════════════════════════════
+  // FACTION CONFIG
+  // ═══════════════════════════════════════════════════════════════
+  
+  function factionConfig(factionId) {
+    const f = store.factions.items[factionId];
+    if (!f) return [];
+    
+    const stateRow = new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`fstates:${factionId}`)
+        .setPlaceholder('Select alert states...')
+        .setMinValues(0)
+        .setMaxValues(STATES.length)
+        .addOptions(STATES.map(s => ({
+          label: s,
+          value: s,
+          emoji: EMOJI[s],
+          default: f.states?.includes(s),
+        }))),
+    );
+    
+    const featureRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`toggle:faction:${factionId}`)
+        .setLabel(f.enabled === false ? 'Enable' : 'Pause')
+        .setStyle(f.enabled === false ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`toggle:foffline:${factionId}`)
+        .setLabel(`Offline (${f.offline?.hours || 24}h)`)
+        .setEmoji('😴')
+        .setStyle(f.offline?.enabled !== false ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`toggle:fdaily:${factionId}`)
+        .setLabel('Daily')
+        .setEmoji('📈')
+        .setStyle(f.daily?.enabled !== false ? ButtonStyle.Success : ButtonStyle.Secondary),
+    );
+    
+    const actionRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`modal:factionwarn:${factionId}`)
+        .setLabel('Warnings')
+        .setEmoji('⏰')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`modal:factionoffline:${factionId}`)
+        .setLabel('Offline Hours')
+        .setEmoji('⚙️')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`remove:faction:${factionId}`)
+        .setLabel('Remove')
+        .setStyle(ButtonStyle.Danger),
+    );
+    
+    const navRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('dash:factions')
+        .setLabel('Back')
+        .setEmoji('◀️')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setURL(LINKS.faction(factionId))
+        .setLabel('View Faction')
+        .setStyle(ButtonStyle.Link),
+    );
+    
+    return [stateRow, featureRow, actionRow, navRow];
+  }
+  
+  // ═══════════════════════════════════════════════════════════════
+  // QUICK ACTIONS
+  // ═══════════════════════════════════════════════════════════════
+  
+  function quickActions(userId, state) {
+    const buttons = [
+      new ButtonBuilder()
+        .setCustomId(`refresh:user:${userId}`)
+        .setLabel('Refresh')
+        .setEmoji('🔄')
+        .setStyle(ButtonStyle.Secondary),
+    ];
+    
+    if (state === 'Traveling') {
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId(`modal:delay:${userId}`)
+          .setLabel('Add Delay')
+          .setEmoji('⏱️')
+          .setStyle(ButtonStyle.Primary),
+      );
+    }
+    
+    buttons.push(
+      new ButtonBuilder()
+        .setURL(LINKS.profile(userId))
+        .setLabel('Profile')
+        .setStyle(ButtonStyle.Link),
+      new ButtonBuilder()
+        .setURL(LINKS.attack(userId))
+        .setLabel('Attack')
+        .setStyle(ButtonStyle.Link),
+    );
+    
+    return [new ActionRowBuilder().addComponents(buttons)];
+  }
+  
+  // ═══════════════════════════════════════════════════════════════
+  // EXPORTS
+  // ═══════════════════════════════════════════════════════════════
+  
+  module.exports = {
+    dashboardButtons,
+    userListMenu,
+    factionListMenu,
+    alertsButtons,
+    userConfig,
+    factionConfig,
+    quickActions,
+  };
+
+================================================================================
+
+File: src/discord/embeds.js
+----------------------------------------
+const { EmbedBuilder } = require('discord.js');
+const store = require('../services/store');
+const { 
+  STATES, BARS, COOLDOWNS, 
+  EMOJI, COLORS, LINKS, 
+  BAR_LINKS, COOLDOWN_LINKS,
+  BAR_ACTIONS, COOLDOWN_ACTIONS,
+} = require('../config/constants');
+const { 
+  formatTime, discordTimestamp, 
+  progressBar, capitalize, formatNumber,
+  formatDestination, getETA,
+} = require('../utils');
+
+// ═══════════════════════════════════════════════════════════════
+// DASHBOARD & OVERVIEW
+// ═══════════════════════════════════════════════════════════════
+
+function dashboard() {
+  const stats = store.getStats();
+  const { self } = store.data;
+  
+  // Bar status with values
+  const barLines = BARS.map(b => {
+    const on = self.bars[b];
+    const last = self.bars.last[b];
+    const val = last ? `\`${last.current}/${last.maximum}\`` : '`—`';
+    return `${EMOJI[b]} ${capitalize(b)}: ${on ? EMOJI.on : EMOJI.off} ${val}`;
+  }).join('\n');
+  
+  // Cooldown status
+  const cdLines = COOLDOWNS.map(c => {
+    const on = self.cooldowns[c];
+    const remaining = self.cooldowns.last[c] || 0;
+    const status = remaining > 0 ? `⏱ ${formatTime(remaining)}` : '✓ Ready';
+    return `${EMOJI[c]} ${capitalize(c)}: ${on ? EMOJI.on : EMOJI.off} ${status}`;
+  }).join('\n');
+  
+  // Chain config
+  const chain = self.chain;
+  const chainInfo = chain.enabled
+    ? `${EMOJI.on} Min: **${chain.min}** • Alerts: ${chain.thresholds.map(formatTime).join(', ')}`
+    : EMOJI.off;
+  
+  return new EmbedBuilder()
+    .setColor(COLORS.brand)
+    .setTitle('📊 Torn Tracker Dashboard')
+    .setDescription([
+      `Monitoring **${stats.users.active}** users, **${stats.factions.active}** factions`,
+      `(${stats.factions.members} total members)`,
+    ].join('\n'))
+    .addFields(
+      {
+        name: `${EMOJI.user} Users`,
+        value: stats.users.total 
+          ? `**${stats.users.active}**/${stats.users.total} active` 
+          : '*None*',
+        inline: true,
+      },
+      {
+        name: `${EMOJI.faction} Factions`,
+        value: stats.factions.total 
+          ? `**${stats.factions.active}**/${stats.factions.total} active` 
+          : '*None*',
+        inline: true,
+      },
+      {
+        name: '📡 Status',
+        value: `${EMOJI.on} Online`,
+        inline: true,
+      },
+      { name: '⚡ Bars', value: barLines, inline: true },
+      { name: '💊 Cooldowns', value: cdLines, inline: true },
+      { name: '\u200b', value: '\u200b', inline: true },
+      { name: `${EMOJI.chain} Chain`, value: chainInfo, inline: false },
+    )
+    .setFooter({ text: 'Use buttons to configure • /help for commands' })
+    .setTimestamp();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// USER VIEWS
+// ═══════════════════════════════════════════════════════════════
+
+function userList(page = 0, perPage = 10) {
+  const entries = Object.entries(store.watchers);
+  
+  if (!entries.length) {
+    return new EmbedBuilder()
+      .setColor(COLORS.brand)
+      .setTitle(`${EMOJI.user} Tracked Users`)
+      .setDescription([
+        'No users tracked yet.',
+        '',
+        '**Quick Start:**',
+        '• Use `/track user <id>` to add someone',
+        '• Get user IDs from their Torn profile URL',
+      ].join('\n'))
+      .setFooter({ text: 'Track targets to get notified when they leave hospital/jail!' });
+  }
+  
+  const totalPages = Math.ceil(entries.length / perPage);
+  const pageEntries = entries.slice(page * perPage, (page + 1) * perPage);
+  
+  const lines = pageEntries.map(([id, cfg]) => {
+    const status = cfg.enabled === false ? EMOJI.off : EMOJI.on;
+    const stateEmoji = EMOJI[cfg.lastState] || EMOJI.Unknown;
+    const states = cfg.states?.length
+      ? cfg.states.map(s => EMOJI[s]).join('')
+      : '`none`';
+    const pre = cfg.preTimesSec?.length
+      ? `\n┃ ⏰ ${cfg.preTimesSec.map(formatTime).join(', ')}`
+      : '';
+    
+    return [
+      `${status} **[${cfg.name || 'Unknown'}](${LINKS.profile(id)})** \`[${id}]\``,
+      `┃ ${stateEmoji} ${cfg.lastState || 'Unknown'}`,
+      `┃ 🔔 ${states}${pre}`,
+    ].join('\n');
+  });
+  
+  return new EmbedBuilder()
+    .setColor(COLORS.brand)
+    .setTitle(`${EMOJI.user} Tracked Users (${entries.length})`)
+    .setDescription(lines.join('\n\n'))
+    .setFooter({ 
+      text: totalPages > 1 
+        ? `Page ${page + 1}/${totalPages} • Select user to configure`
+        : 'Select a user to configure',
+    });
+}
+
+function userStatus(userId, profile, cfg) {
+  const status = profile?.status || {};
+  const state = status.state || 'Unknown';
+  const travel = cfg?.travel;
+  
+  const embed = new EmbedBuilder()
+    .setColor(COLORS[state] || COLORS.brand)
+    .setAuthor({
+      name: `${profile?.name || cfg?.name || 'User'} [${userId}]`,
+      url: LINKS.profile(userId),
+    })
+    .setTitle(`${EMOJI[state] || EMOJI.Unknown} ${state}`)
+    .setURL(LINKS.profile(userId))
+    .setTimestamp();
+  
+  const lines = [];
+  if (status.description) {
+    lines.push(`> ${status.description}`);
+  }
+  
+  // State-specific info with action links
+  if (state === 'Traveling' && travel?.earliest) {
+    const eta = getETA(travel);
+    lines.push(
+      '',
+      `✈️ ${formatDestination(travel)}`,
+      `**ETA:** ${discordTimestamp(eta, 'R')} (${discordTimestamp(eta, 't')})`,
+    );
+  } else if (state === 'Jail' && status.until) {
+    const until = Number(status.until);
+    lines.push(
+      '',
+      `**Released:** ${discordTimestamp(until, 'R')} (${discordTimestamp(until, 't')})`,
+      `🔗 [View in Jail](${LINKS.jail})`,
+    );
+  } else if (state === 'Hospital' && status.until) {
+    const until = Number(status.until);
+    lines.push(
+      '',
+      `**Discharged:** ${discordTimestamp(until, 'R')} (${discordTimestamp(until, 't')})`,
+      `🔗 [View in Hospital](${LINKS.hospital})`,
+    );
+  } else if (state === 'Okay') {
+    lines.push('', `🎯 [Attack](${LINKS.attack(userId)}) • [Profile](${LINKS.profile(userId)})`);
+  } else if (state === 'Abroad') {
+    lines.push('', `🔗 [Travel Agency](${LINKS.travel})`);
+  }
+  
+  // Last action
+  const lastAction = profile?.last_action?.timestamp;
+  if (lastAction) {
+    lines.push('', `**Last Active:** ${discordTimestamp(lastAction, 'R')}`);
+  }
+  
+  embed.setDescription(lines.join('\n') || '*No additional info*');
+  
+  // Tracking configuration
+  if (cfg) {
+    const alerts = cfg.states?.length
+      ? cfg.states.map(s => `${EMOJI[s]} ${s}`).join('\n')
+      : '*None*';
+    
+    const warnings = cfg.preTimesSec?.length
+      ? cfg.preTimesSec.map(formatTime).join(', ')
+      : '*None*';
+    
+    const statusText = cfg.enabled === false
+      ? `${EMOJI.off} Paused`
+      : `${EMOJI.on} Active`;
+    
+    embed.addFields(
+      { name: '🔔 Alerts', value: alerts, inline: true },
+      { name: '⏰ Warnings', value: warnings, inline: true },
+      { name: '📡 Status', value: statusText, inline: true },
+    );
+  }
+  
+  return embed;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// FACTION VIEWS
+// ═══════════════════════════════════════════════════════════════
+
+function factionList(page = 0, perPage = 5) {
+  const entries = Object.entries(store.factions.items);
+  
+  if (!entries.length) {
+    return new EmbedBuilder()
+      .setColor(COLORS.brand)
+      .setTitle(`${EMOJI.faction} Tracked Factions`)
+      .setDescription([
+        'No factions tracked yet.',
+        '',
+        '**Quick Start:**',
+        '• Use `/track faction <id>` to add one',
+        '• Get faction IDs from the faction page URL',
+      ].join('\n'))
+      .setFooter({ text: 'Track your faction to monitor member activity!' });
+  }
+  
+  const totalPages = Math.ceil(entries.length / perPage);
+  const pageEntries = entries.slice(page * perPage, (page + 1) * perPage);
+  
+  const lines = pageEntries.map(([id, f]) => {
+    const status = f.enabled === false ? EMOJI.off : EMOJI.on;
+    const memberCount = Object.keys(f.members || {}).length;
+    const states = f.states?.length
+      ? f.states.map(s => EMOJI[s]).join('')
+      : '`none`';
+    
+    const features = [
+      f.offline?.enabled !== false ? `😴 >${f.offline?.hours || 24}h` : null,
+      f.daily?.enabled !== false ? '📈 Daily' : null,
+    ].filter(Boolean).join(' • ');
+    
+    return [
+      `${status} **[${f.name || `Faction ${id}`}](${LINKS.faction(id)})** \`[${id}]\``,
+      `┃ 👥 ${memberCount} members`,
+      `┃ 🔔 ${states}`,
+      features ? `┃ ${features}` : null,
+    ].filter(Boolean).join('\n');
+  });
+  
+  return new EmbedBuilder()
+    .setColor(COLORS.brand)
+    .setTitle(`${EMOJI.faction} Tracked Factions (${entries.length})`)
+    .setDescription(lines.join('\n\n'))
+    .setFooter({
+      text: totalPages > 1
+        ? `Page ${page + 1}/${totalPages} • Select faction to configure`
+        : 'Select a faction to configure',
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PERSONAL ALERTS
+// ═══════════════════════════════════════════════════════════════
+
+function alertsConfig() {
+  const { self } = store.data;
+  
+  const barLines = BARS.map(b => {
+    const on = self.bars[b];
+    const last = self.bars.last[b];
+    const bar = last 
+      ? progressBar(last.current || 0, last.maximum || 100, 10)
+      : '`No data`';
+    const link = BAR_LINKS[b] ? `[Use →](${BAR_LINKS[b]})` : '';
+    
+    return `${EMOJI[b]} **${capitalize(b)}** ${on ? EMOJI.on : EMOJI.off}\n┗ ${bar} ${link}`;
+  });
+  
+  const cdLines = COOLDOWNS.map(c => {
+    const on = self.cooldowns[c];
+    const remaining = self.cooldowns.last[c] || 0;
+    const status = remaining > 0 ? `⏱ ${formatTime(remaining)}` : '✅ Ready';
+    const link = COOLDOWN_LINKS[c] ? `[Use →](${COOLDOWN_LINKS[c]})` : '';
+    
+    return `${EMOJI[c]} **${capitalize(c)}** ${on ? EMOJI.on : EMOJI.off}\n┗ ${status} ${link}`;
+  });
+  
+  const chain = self.chain;
+  const chainLine = chain.enabled
+    ? `${EMOJI.on} **Enabled**\n┗ Min: **${chain.min}** • Alerts: ${chain.thresholds.map(formatTime).join(', ')}`
+    : `${EMOJI.off} **Disabled**`;
+  
+  return new EmbedBuilder()
+    .setColor(COLORS.brand)
+    .setTitle('🔔 Personal Alerts')
+    .setDescription('Get notified when your bars fill or cooldowns expire.')
+    .addFields(
+      { name: '⚡ Bar Alerts (full)', value: barLines.join('\n\n'), inline: false },
+      { name: '💊 Cooldown Alerts (ready)', value: cdLines.join('\n\n'), inline: false },
+      { name: '⛓️ Chain Alerts', value: chainLine, inline: false },
+    )
+    .setFooter({ text: 'Toggle with buttons below' })
+    .setTimestamp();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NOTIFICATIONS - State Changes
+// ═══════════════════════════════════════════════════════════════
+
+function stateChange(userId, name, oldState, newState, status, travel) {
+  const lines = [];
+  
+  if (status?.description) {
+    lines.push(`> ${status.description}`);
+  }
+  
+  if (newState === 'Traveling' && travel?.earliest) {
+    const eta = getETA(travel);
+    lines.push(
+      '',
+      `✈️ ${formatDestination(travel)}`,
+      `**ETA:** ${discordTimestamp(eta, 'R')}`,
+    );
+  } else if (newState === 'Jail' && status?.until) {
+    const until = Number(status.until);
+    lines.push(
+      '',
+      `**Released:** ${discordTimestamp(until, 'R')}`,
+      `🔗 [View in Jail](${LINKS.jail})`,
+    );
+  } else if (newState === 'Hospital' && status?.until) {
+    const until = Number(status.until);
+    lines.push(
+      '',
+      `**Discharged:** ${discordTimestamp(until, 'R')}`,
+      `🔗 [View in Hospital](${LINKS.hospital})`,
+    );
+  } else if (newState === 'Okay' && oldState !== 'Okay') {
+    lines.push('', `🎯 **[Attack Now!](${LINKS.attack(userId)})**`);
+  }
+  
+  return new EmbedBuilder()
+    .setColor(COLORS[newState] || COLORS.brand)
+    .setTitle(`${EMOJI[newState] || EMOJI.Unknown} ${name} → ${newState}`)
+    .setURL(LINKS.profile(userId))
+    .setDescription(lines.join('\n') || null)
+    .addFields({
+      name: 'Previous',
+      value: `${EMOJI[oldState] || EMOJI.Unknown} ${oldState || 'Unknown'}`,
+      inline: true,
+    })
+    .setFooter({ text: `ID: ${userId}` })
+    .setTimestamp();
+}
+
+function preAlert(name, userId, state, endAt, left) {
+  const stateLinks = {
+    Jail: `[View in Jail](${LINKS.jail})`,
+    Hospital: `[View in Hospital](${LINKS.hospital})`,
+    Traveling: `[Travel Agency](${LINKS.travel})`,
+  };
+  
+  return new EmbedBuilder()
+    .setColor(COLORS.warn)
+    .setTitle(`⏰ ${name} - ${state} ending soon!`)
+    .setURL(LINKS.profile(userId))
+    .setDescription([
+      `**Ends:** ${discordTimestamp(endAt, 'R')} (${discordTimestamp(endAt, 't')})`,
+      `**Time left:** ~${formatTime(left)}`,
+      '',
+      `🎯 [Attack](${LINKS.attack(userId)})`,
+      stateLinks[state] || '',
+    ].filter(Boolean).join('\n'))
+    .setFooter({ text: `ID: ${userId} • Get ready!` })
+    .setTimestamp();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NOTIFICATIONS - Personal Alerts
+// ═══════════════════════════════════════════════════════════════
+
+function barFull(kind, bar) {
+  const action = BAR_ACTIONS[kind] || { text: '', link: '' };
+  
+  return new EmbedBuilder()
+    .setColor(COLORS.good)
+    .setTitle(`${EMOJI[kind]} ${capitalize(kind)} is FULL!`)
+    .setDescription([
+      progressBar(bar.current, bar.maximum, 20),
+      `**${formatNumber(bar.current)}** / **${formatNumber(bar.maximum)}**`,
+      '',
+      action.text,
+      action.link ? `🔗 [Go Now →](${action.link})` : '',
+    ].filter(Boolean).join('\n'))
+    .setTimestamp();
+}
+
+function cooldownReady(kind) {
+  const action = COOLDOWN_ACTIONS[kind] || { text: 'Cooldown ready!', link: '' };
+  
+  return new EmbedBuilder()
+    .setColor(COLORS.good)
+    .setTitle(`${EMOJI[kind]} ${capitalize(kind)} Cooldown Ready!`)
+    .setDescription([
+      action.text,
+      action.link ? `🔗 [Use Now →](${action.link})` : '',
+    ].filter(Boolean).join('\n'))
+    .setTimestamp();
+}
+
+function chainAlert(chain, threshold) {
+  const urgent = chain.timeout <= 30;
+  const bar = progressBar(chain.timeout, 300, 20, { showValues: false });
+  const pct = Math.round((chain.timeout / 300) * 100);
+  
+  return new EmbedBuilder()
+    .setColor(urgent ? COLORS.bad : COLORS.warn)
+    .setTitle(`${urgent ? '🚨' : EMOJI.chain} Chain Alert! ${urgent ? '🚨' : ''}`)
+    .setDescription([
+      `**Chain:** ${formatNumber(chain.current)} / ${formatNumber(chain.maximum)}`,
+      `**Time Left:** ${formatTime(chain.timeout)} (${pct}%)`,
+      '',
+      bar,
+      '',
+      urgent ? '⚠️ **CHAIN ABOUT TO DROP!**' : `Alert at: ${formatTime(threshold)}`,
+    ].join('\n'))
+    .setTimestamp();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NOTIFICATIONS - Faction Alerts
+// ═══════════════════════════════════════════════════════════════
+
+function factionMemberChange(fName, fid, uid, member, oldState, newState, travel) {
+  const lines = [`**Faction:** [${fName}](${LINKS.faction(fid)})`];
+  
+  if (newState === 'Traveling' && travel?.earliest) {
+    const eta = getETA(travel);
+    lines.push('', `✈️ ${formatDestination(travel)}`, `**ETA:** ${discordTimestamp(eta, 'R')}`);
+  } else if (newState === 'Jail' && member?.status?.until) {
+    lines.push('', `**Released:** ${discordTimestamp(Number(member.status.until), 'R')}`);
+  } else if (newState === 'Hospital' && member?.status?.until) {
+    lines.push('', `**Discharged:** ${discordTimestamp(Number(member.status.until), 'R')}`);
+  } else if (newState === 'Okay' && ['Jail', 'Hospital'].includes(oldState)) {
+    lines.push('', `🎯 [Attack](${LINKS.attack(uid)})`);
+  }
+  
+  return new EmbedBuilder()
+    .setColor(COLORS[newState] || COLORS.brand)
+    .setTitle(`${EMOJI[newState] || EMOJI.Unknown} ${member.name} → ${newState}`)
+    .setURL(LINKS.profile(uid))
+    .setDescription(lines.join('\n'))
+    .addFields({
+      name: 'Previous',
+      value: `${EMOJI[oldState] || EMOJI.Unknown} ${oldState || 'Unknown'}`,
+      inline: true,
+    })
+    .setFooter({ text: `Member ID: ${uid}` })
+    .setTimestamp();
+}
+
+function factionJoinLeave(type, fName, fid, uid, name) {
+  const isJoin = type === 'join';
+  
+  return new EmbedBuilder()
+    .setColor(isJoin ? COLORS.good : COLORS.bad)
+    .setTitle(`${isJoin ? '🟢 Member Joined' : '🔴 Member Left'}`)
+    .setURL(LINKS.profile(uid))
+    .setDescription([
+      `**${name}** has ${isJoin ? 'joined' : 'left'} **${fName}**`,
+      '',
+      `👤 [Profile](${LINKS.profile(uid)})`,
+      `🏴 [Faction](${LINKS.faction(fid)})`,
+    ].join('\n'))
+    .setFooter({ text: `ID: ${uid}` })
+    .setTimestamp();
+}
+
+function factionOffline(fName, fid, uid, name, lastTs, hours) {
+  const lastSeen = Number(lastTs);
+  const offlineHours = Math.floor((Date.now() / 1000 - lastSeen) / 3600);
+  
+  return new EmbedBuilder()
+    .setColor(COLORS.warn)
+    .setTitle(`😴 ${name} - Inactive`)
+    .setURL(LINKS.profile(uid))
+    .setDescription([
+      `**Faction:** [${fName}](${LINKS.faction(fid)})`,
+      '',
+      `**Last seen:** ${discordTimestamp(lastSeen, 'R')}`,
+      `**Offline:** ~${offlineHours} hours`,
+      '',
+      `⚠️ Exceeds ${hours}h threshold`,
+    ].join('\n'))
+    .setFooter({ text: `ID: ${uid}` })
+    .setTimestamp();
+}
+
+function factionDaily(fName, fid, delta, total) {
+  const up = delta >= 0;
+  
+  return new EmbedBuilder()
+    .setColor(up ? COLORS.good : COLORS.warn)
+    .setTitle(`📊 ${fName} - Daily Report`)
+    .setURL(LINKS.faction(fid))
+    .setDescription([
+      `${up ? '📈' : '📉'} **${up ? '+' : ''}${formatNumber(delta)}** respect today`,
+      `**Total:** ${formatNumber(total)} respect`,
+    ].join('\n'))
+    .setTimestamp();
+}
+
+function factionMilestone(fName, fid, respect) {
+  const milestone = Math.floor(respect / 100000) * 100000;
+  
+  return new EmbedBuilder()
+    .setColor(COLORS.good)
+    .setTitle('🎉 Milestone Reached!')
+    .setURL(LINKS.faction(fid))
+    .setDescription([
+      `**${fName}** hit **${formatNumber(milestone)}** respect!`,
+      '',
+      '🎊 Congratulations!',
+    ].join('\n'))
+    .setTimestamp();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// HELP & UTILITY
+// ═══════════════════════════════════════════════════════════════
+
+function help() {
+  return new EmbedBuilder()
+    .setColor(COLORS.brand)
+    .setTitle('📖 Torn Tracker Help')
+    .setDescription('Track players, factions, and get personal alerts.')
+    .addFields(
+      {
+        name: '📊 Overview',
+        value: [
+          '`/dashboard` - Main control panel',
+          '`/status <id>` - Quick status check',
+        ].join('\n'),
+        inline: false,
+      },
+      {
+        name: '👤 User Tracking',
+        value: [
+          '`/track user <id>` - Add user',
+          '  `alerts`: States (jail, hospital, okay, traveling)',
+          '  `warn`: Early warnings (5m, 2m)',
+          '`/remove <id>` - Stop tracking',
+          '`/delay <id> <time>` - Add travel delay',
+        ].join('\n'),
+        inline: false,
+      },
+      {
+        name: '🏴 Faction Tracking',
+        value: [
+          '`/track faction <id>` - Add faction',
+          '  `offline`: Hours before alert (default: 24)',
+          '`/remove <id>` - Stop tracking',
+        ].join('\n'),
+        inline: false,
+      },
+      {
+        name: '🔔 Personal Alerts',
+        value: [
+          '`/alerts` - Configure bar/cooldown/chain alerts',
+          '',
+          '**Quick Links:**',
+          `[Drugs](${LINKS.drugs}) • [Boosters](${LINKS.boosters}) • [Alcohol](${LINKS.alcohol})`,
+          `[Medical](${LINKS.medical}) • [Gym](${LINKS.gym}) • [Crimes](${LINKS.crimes})`,
+        ].join('\n'),
+        inline: false,
+      },
+      {
+        name: '💡 Tips',
+        value: [
+          '• **Times:** `5m`, `1h30m`, `90s`',
+          '• **States:** `okay`, `hospital`, `jail`, `traveling`',
+          '• Use button menus for easy configuration!',
+        ].join('\n'),
+        inline: false,
+      },
+    )
+    .setFooter({ text: 'Most settings available through button menus!' })
+    .setTimestamp();
+}
+
+function error(title, message, suggestion = null) {
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.bad)
+    .setTitle(`${EMOJI.error} ${title}`)
+    .setDescription(message);
+  
+  if (suggestion) {
+    embed.addFields({ name: '💡 Suggestion', value: suggestion, inline: false });
+  }
+  
+  return embed.setTimestamp();
+}
+
+function success(title, message) {
+  return new EmbedBuilder()
+    .setColor(COLORS.good)
+    .setTitle(`${EMOJI.success} ${title}`)
+    .setDescription(message)
+    .setTimestamp();
+}
+
+function loading(message = 'Loading...') {
+  return new EmbedBuilder()
+    .setColor(COLORS.brand)
+    .setDescription(`${EMOJI.loading} ${message}`);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EXPORTS
+// ═══════════════════════════════════════════════════════════════
+
+module.exports = {
+  // Dashboard
+  dashboard,
+  
+  // Users
+  userList,
+  userStatus,
+  
+  // Factions
+  factionList,
+  
+  // Alerts config
+  alertsConfig,
+  
+  // Notifications - User
+  stateChange,
+  preAlert,
+  
+  // Notifications - Personal
+  barFull,
+  cooldownReady,
+  chainAlert,
+  
+  // Notifications - Faction
+  factionMemberChange,
+  factionJoinLeave,
+  factionOffline,
+  factionDaily,
+  factionMilestone,
+  
+  // Utility
+  help,
+  error,
+  success,
+  loading,
+};
+
+================================================================================
+
+File: src/discord/handlers.js
+----------------------------------------
+const config = require('../config');
+const store = require('../services/store');
+const api = require('../services/api');
+const Embeds = require('./embeds');
+const Components = require('./components');
+const Modals = require('./modals');
+const { parseStates, parseTimes, parseTime, formatTime } = require('../utils');
+const { createTravelInfo } = require('../utils/travel');
+const { COLORS } = require('../config/constants');
+const { EmbedBuilder } = require('discord.js');
+
+// Forward declaration - will be set by index.js
+let startPollers = () => {};
+
+function setPollerStarter(fn) {
+  startPollers = fn;
+}
+
+/**
+ * Handle all Discord interactions
+ */
+async function handleInteraction(interaction) {
+  // Owner check
+  if (interaction.user.id !== config.discord.ownerId) {
+    return interaction.reply?.({ 
+      content: '🔒 This bot is owner-only.', 
+      ephemeral: true,
+    }).catch(() => {});
+  }
+  
+  const ephemeral = interaction.inGuild();
+  
+  try {
+    if (interaction.isModalSubmit()) {
+      await handleModal(interaction, ephemeral);
+    } else if (interaction.isButton()) {
+      await handleButton(interaction);
+    } else if (interaction.isStringSelectMenu()) {
+      await handleSelect(interaction);
+    } else if (interaction.isChatInputCommand()) {
+      await handleCommand(interaction, ephemeral);
+    }
+  } catch (error) {
+    console.error('[handler]', error);
+    
+    const msg = `❌ ${error.message}`;
+    
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(msg).catch(() => {});
+    } else {
+      await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MODAL HANDLERS
+// ═══════════════════════════════════════════════════════════════
+
+async function handleModal(i, ephemeral) {
+  const [, type, id] = i.customId.split(':');
+  
+  await i.deferUpdate().catch(() => i.deferReply({ ephemeral }));
+  
+  switch (type) {
+    case 'adduser': {
+      const userId = i.fields.getTextInputValue('user_id').trim();
+      const states = parseStates(i.fields.getTextInputValue('states') || 'all');
+      const warn = parseTimes(i.fields.getTextInputValue('warn'));
+      
+      if (store.watchers[userId]) {
+        return i.editReply({ content: '⚠️ Already tracking this user' });
+      }
+      
+      let profile;
+      try {
+        profile = await api.getProfile(userId);
+      } catch {
+        return i.editReply({ content: '❌ User not found' });
+      }
+      
+      store.watchers[userId] = {
+        name: profile.name,
+        states,
+        preTimesSec: warn.length ? warn : undefined,
+        enabled: true,
+        lastState: profile.status?.state || 'Okay',
+        preFired: {},
+        travel: profile.status?.state === 'Traveling' 
+          ? createTravelInfo(profile.status) 
+          : null,
+      };
+      
+      store.save('add-user');
+      startPollers();
+      
+      return i.editReply({
+        content: `✅ Now tracking **${profile.name}**`,
+        embeds: [Embeds.userStatus(userId, profile, store.watchers[userId])],
+        components: Components.userConfig(userId),
+      });
+    }
+    
+    case 'addfaction': {
+      const fid = i.fields.getTextInputValue('faction_id').trim();
+      const states = parseStates(i.fields.getTextInputValue('states') || 'all');
+      const offline = parseInt(i.fields.getTextInputValue('offline')) || config.defaults.offlineHours;
+      
+      if (store.factions.items[fid]) {
+        return i.editReply({ content: '⚠️ Already tracking this faction' });
+      }
+      
+      let data;
+      try {
+        data = await api.getFaction(fid);
+      } catch {
+        return i.editReply({ content: '❌ Faction not found' });
+      }
+      
+      store.factions.items[fid] = {
+        id: fid,
+        name: data.name,
+        tag: data.tag,
+        enabled: true,
+        states,
+        members: {},
+        offline: { enabled: true, hours: offline },
+        daily: { enabled: true },
+      };
+      
+      store.save('add-faction');
+      startPollers();
+      
+      return i.editReply({
+        content: `✅ Now tracking **${data.name}** (${Object.keys(data.members || {}).length} members)`,
+        components: Components.factionConfig(fid),
+      });
+    }
+    
+    case 'chain': {
+      const min = parseInt(i.fields.getTextInputValue('min')) || 10;
+      const thresholds = parseTimes(i.fields.getTextInputValue('thresholds'));
+      
+      store.self.chain.min = min;
+      if (thresholds.length) {
+        store.self.chain.thresholds = thresholds;
+      }
+      
+      store.save('chain-config');
+      
+      return i.editReply({
+        embeds: [Embeds.alertsConfig()],
+        components: Components.alertsButtons(),
+      });
+    }
+    
+    case 'userwarn': {
+      const warn = parseTimes(i.fields.getTextInputValue('warn'));
+      const cfg = store.watchers[id];
+      
+      if (cfg) {
+        cfg.preTimesSec = warn.length ? warn : undefined;
+        store.save('user-warn');
+      }
+      
+      const profile = await api.getProfile(id).catch(() => null);
+      
+      return i.editReply({
+        embeds: [Embeds.userStatus(id, profile, cfg)],
+        components: Components.userConfig(id),
+      });
+    }
+    
+    case 'factionwarn': {
+      const warn = parseTimes(i.fields.getTextInputValue('warn'));
+      const f = store.factions.items[id];
+      
+      if (f) {
+        f.preTimesSec = warn.length ? warn : undefined;
+        store.save('faction-warn');
+      }
+      
+      return i.editReply({
+        embeds: [Embeds.factionList()],
+        components: Components.factionConfig(id),
+      });
+    }
+    
+    case 'factionoffline': {
+      const hours = parseInt(i.fields.getTextInputValue('hours')) || config.defaults.offlineHours;
+      const f = store.factions.items[id];
+      
+      if (f) {
+        f.offline = f.offline || {};
+        f.offline.hours = hours;
+        store.save('faction-offline');
+      }
+      
+      return i.editReply({
+        components: Components.factionConfig(id),
+      });
+    }
+    
+    case 'delay': {
+      const time = parseTime(i.fields.getTextInputValue('time')) || 0;
+      const cfg = store.watchers[id];
+      
+      if (cfg?.travel) {
+        cfg.travel.earliest = (cfg.travel.earliest || 0) + time;
+        cfg.travel.latest = (cfg.travel.latest || 0) + time;
+        store.save('delay');
+      }
+      
+      const profile = await api.getProfile(id).catch(() => null);
+      
+      return i.editReply({
+        content: `✅ Added ${formatTime(time)} delay`,
+        embeds: [Embeds.userStatus(id, profile, cfg)],
+      });
+    }
+    
+    default:
+      return i.editReply({ content: '❌ Unknown modal type' });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// BUTTON HANDLERS
+// ═══════════════════════════════════════════════════════════════
+
+async function handleButton(i) {
+  const [action, type, id] = i.customId.split(':');
+  
+  // Dashboard navigation
+  if (action === 'dash') {
+    await i.deferUpdate();
+    
+    switch (type) {
+      case 'main':
+      case 'refresh':
+        return i.editReply({
+          embeds: [Embeds.dashboard()],
+          components: Components.dashboardButtons(),
+        });
+      
+      case 'users':
+        return i.editReply({
+          embeds: [Embeds.userList()],
+          components: Components.userListMenu(),
+        });
+      
+      case 'factions':
+        return i.editReply({
+          embeds: [Embeds.factionList()],
+          components: Components.factionListMenu(),
+        });
+      
+      case 'alerts':
+        return i.editReply({
+          embeds: [Embeds.alertsConfig()],
+          components: Components.alertsButtons(),
+        });
+    }
+  }
+  
+  // Modal triggers
+  if (action === 'modal') {
+    switch (type) {
+      case 'adduser':
+        return i.showModal(Modals.addUser());
+      case 'addfaction':
+        return i.showModal(Modals.addFaction());
+      case 'chain':
+        return i.showModal(Modals.chainConfig());
+      case 'userwarn':
+        return i.showModal(Modals.userWarn(id));
+      case 'factionwarn':
+        return i.showModal(Modals.factionWarn(id));
+      case 'factionoffline':
+        return i.showModal(Modals.factionOffline(id));
+      case 'delay':
+        return i.showModal(Modals.delay(id));
+    }
+  }
+  
+  // Toggle actions
+  if (action === 'toggle') {
+    await i.deferUpdate();
+    
+    switch (type) {
+      case 'bar': {
+        store.self.bars[id] = !store.self.bars[id];
+        store.save('toggle-bar');
+        startPollers();
+        
+        return i.editReply({
+          embeds: [Embeds.alertsConfig()],
+          components: Components.alertsButtons(),
+        });
+      }
+      
+      case 'cd': {
+        store.self.cooldowns[id] = !store.self.cooldowns[id];
+        store.save('toggle-cd');
+        startPollers();
+        
+        return i.editReply({
+          embeds: [Embeds.alertsConfig()],
+          components: Components.alertsButtons(),
+        });
+      }
+      
+      case 'chain': {
+        store.self.chain.enabled = !store.self.chain.enabled;
+        store.save('toggle-chain');
+        startPollers();
+        
+        return i.editReply({
+          embeds: [Embeds.alertsConfig()],
+          components: Components.alertsButtons(),
+        });
+      }
+      
+      case 'user': {
+        const cfg = store.watchers[id];
+        if (cfg) {
+          cfg.enabled = cfg.enabled === false;
+        }
+        store.save('toggle-user');
+        startPollers();
+        
+        const profile = await api.getProfile(id).catch(() => null);
+        
+        return i.editReply({
+          embeds: [Embeds.userStatus(id, profile, cfg)],
+          components: Components.userConfig(id),
+        });
+      }
+      
+      case 'faction': {
+        const f = store.factions.items[id];
+        if (f) {
+          f.enabled = f.enabled === false;
+        }
+        store.save('toggle-faction');
+        startPollers();
+        
+        return i.editReply({
+          components: Components.factionConfig(id),
+        });
+      }
+      
+      case 'foffline': {
+        const f = store.factions.items[id];
+        if (f) {
+          f.offline = f.offline || {};
+          f.offline.enabled = f.offline.enabled === false;
+        }
+        store.save('toggle-foffline');
+        
+        return i.editReply({
+          components: Components.factionConfig(id),
+        });
+      }
+      
+      case 'fdaily': {
+        const f = store.factions.items[id];
+        if (f) {
+          f.daily = f.daily || {};
+          f.daily.enabled = f.daily.enabled === false;
+        }
+        store.save('toggle-fdaily');
+        
+        return i.editReply({
+          components: Components.factionConfig(id),
+        });
+      }
+    }
+  }
+  
+  // Remove actions
+  if (action === 'remove') {
+    await i.deferUpdate();
+    
+    if (type === 'user') {
+      delete store.watchers[id];
+      store.save('remove-user');
+      startPollers();
+      
+      return i.editReply({
+        content: '✅ User removed',
+        embeds: [Embeds.userList()],
+        components: Components.userListMenu(),
+      });
+    }
+    
+    if (type === 'faction') {
+      delete store.factions.items[id];
+      store.save('remove-faction');
+      startPollers();
+      
+      return i.editReply({
+        content: '✅ Faction removed',
+        embeds: [Embeds.factionList()],
+        components: Components.factionListMenu(),
+      });
+    }
+  }
+  
+  // Refresh actions
+  if (action === 'refresh') {
+    await i.deferUpdate();
+    
+    if (type === 'user') {
+      const cfg = store.watchers[id];
+      const profile = await api.getProfile(id).catch(() => null);
+      
+      if (profile && cfg) {
+        cfg.name = profile.name;
+        cfg.lastState = profile.status?.state;
+        if (profile.status?.state === 'Traveling') {
+          cfg.travel = createTravelInfo(profile.status);
+        }
+        store.save('refresh');
+      }
+      
+      return i.editReply({
+        embeds: [Embeds.userStatus(id, profile, cfg)],
+        components: Components.userConfig(id),
+      });
+    }
+  }
+  
+  // Alerts refresh
+  if (action === 'alerts' && type === 'refresh') {
+    await i.deferUpdate();
+    
+    // Import and call poll functions
+    const { pollBars, pollCooldowns } = require('../pollers/self');
+    await pollBars().catch(() => {});
+    await pollCooldowns().catch(() => {});
+    
+    return i.editReply({
+      embeds: [Embeds.alertsConfig()],
+      components: Components.alertsButtons(),
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SELECT MENU HANDLERS
+// ═══════════════════════════════════════════════════════════════
+
+async function handleSelect(i) {
+  await i.deferUpdate();
+  
+  const [type, id] = i.customId.split(':');
+  
+  if (type === 'select') {
+    if (id === 'user') {
+      const userId = i.values[0];
+      const cfg = store.watchers[userId];
+      const profile = await api.getProfile(userId).catch(() => null);
+      
+      return i.editReply({
+        embeds: [Embeds.userStatus(userId, profile, cfg)],
+        components: Components.userConfig(userId),
+      });
+    }
+    
+    if (id === 'faction') {
+      const fid = i.values[0];
+      
+      return i.editReply({
+        components: Components.factionConfig(fid),
+      });
+    }
+  }
+  
+  // State selection for users
+  if (type === 'states') {
+    const cfg = store.watchers[id];
+    if (cfg) {
+      cfg.states = i.values;
+    }
+    store.save('states');
+    
+    const profile = await api.getProfile(id).catch(() => null);
+    
+    return i.editReply({
+      embeds: [Embeds.userStatus(id, profile, cfg)],
+      components: Components.userConfig(id),
+    });
+  }
+  
+  // State selection for factions
+  if (type === 'fstates') {
+    const f = store.factions.items[id];
+    if (f) {
+      f.states = i.values;
+    }
+    store.save('fstates');
+    
+    return i.editReply({
+      components: Components.factionConfig(id),
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SLASH COMMAND HANDLERS
+// ═══════════════════════════════════════════════════════════════
+
+async function handleCommand(i, ephemeral) {
+  await i.deferReply({ ephemeral });
+  
+  switch (i.commandName) {
+    case 'dashboard':
+      return i.editReply({
+        embeds: [Embeds.dashboard()],
+        components: Components.dashboardButtons(),
+      });
+    
+    case 'help':
+      return i.editReply({
+        embeds: [Embeds.help()],
+      });
+    
+    case 'alerts':
+      return i.editReply({
+        embeds: [Embeds.alertsConfig()],
+        components: Components.alertsButtons(),
+      });
+    
+    case 'track':
+      return handleTrackCommand(i);
+    
+    case 'status':
+      return handleStatusCommand(i);
+    
+    case 'remove':
+      return handleRemoveCommand(i);
+    
+    case 'delay':
+      return handleDelayCommand(i);
+    
+    default:
+      return i.editReply({ content: '❌ Unknown command' });
+  }
+}
+
+async function handleTrackCommand(i) {
+  const sub = i.options.getSubcommand();
+  
+  if (sub === 'user') {
+    const userId = String(i.options.getInteger('id'));
+    const states = parseStates(i.options.getString('alerts'));
+    const warn = parseTimes(i.options.getString('warn'));
+    
+    if (store.watchers[userId]) {
+      return i.editReply({ content: '⚠️ Already tracking this user' });
+    }
+    
+    let profile;
+    try {
+      profile = await api.getProfile(userId);
+    } catch {
+      return i.editReply({ content: '❌ User not found' });
+    }
+    
+    store.watchers[userId] = {
+      name: profile.name,
+      states,
+      preTimesSec: warn.length ? warn : undefined,
+      enabled: true,
+      lastState: profile.status?.state || 'Okay',
+      preFired: {},
+      travel: profile.status?.state === 'Traveling' 
+        ? createTravelInfo(profile.status) 
+        : null,
+    };
+    
+    store.save('add');
+    startPollers();
+    
+    return i.editReply({
+      embeds: [Embeds.userStatus(userId, profile, store.watchers[userId])],
+      components: Components.userConfig(userId),
+    });
+  }
+  
+  if (sub === 'faction') {
+    const fid = String(i.options.getInteger('id'));
+    const states = parseStates(i.options.getString('alerts'));
+    const warn = parseTimes(i.options.getString('warn'));
+    const offline = i.options.getInteger('offline') || config.defaults.offlineHours;
+    
+    if (store.factions.items[fid]) {
+      return i.editReply({ content: '⚠️ Already tracking this faction' });
+    }
+    
+    let data;
+    try {
+      data = await api.getFaction(fid);
+    } catch {
+      return i.editReply({ content: '❌ Faction not found' });
+    }
+    
+    store.factions.items[fid] = {
+      id: fid,
+      name: data.name,
+      enabled: true,
+      states,
+      preTimesSec: warn.length ? warn : undefined,
+      members: {},
+      offline: { enabled: true, hours: offline },
+      daily: { enabled: true },
+    };
+    
+    store.save('add-faction');
+    startPollers();
+    
+    return i.editReply({
+      content: `✅ Tracking **${data.name}**`,
+      components: Components.factionConfig(fid),
+    });
+  }
+}
+
+async function handleStatusCommand(i) {
+  const id = String(i.options.getInteger('id'));
+  
+  // Try user first
+  try {
+    const profile = await api.getProfile(id);
+    const cfg = store.watchers[id];
+    
+    return i.editReply({
+      embeds: [Embeds.userStatus(id, profile, cfg)],
+      components: cfg 
+        ? Components.userConfig(id) 
+        : Components.quickActions(id, profile.status?.state),
+    });
+  } catch {}
+  
+  // Try faction
+  try {
+    const data = await api.getFaction(id);
+    const f = store.factions.items[id];
+    const memberCount = Object.keys(data.members || {}).length;
+    
+    const embed = new EmbedBuilder()
+      .setColor(COLORS.brand)
+      .setTitle(`🏴 ${data.name}`)
+      .addFields(
+        { name: 'Members', value: String(memberCount), inline: true },
+        { name: 'Respect', value: Number(data.respect || 0).toLocaleString(), inline: true },
+        { 
+          name: 'Tracking', 
+          value: f 
+            ? (f.enabled === false ? '🔴 Paused' : '🟢 Active') 
+            : 'Not tracked', 
+          inline: true,
+        },
+      );
+    
+    return i.editReply({
+      embeds: [embed],
+      components: f ? Components.factionConfig(id) : [],
+    });
+  } catch {}
+  
+  return i.editReply({ content: '❌ Not found' });
+}
+
+async function handleRemoveCommand(i) {
+  const id = String(i.options.getInteger('id'));
+  
+  if (store.watchers[id]) {
+    delete store.watchers[id];
+    store.save('remove');
+    startPollers();
+    return i.editReply({ content: '✅ User removed' });
+  }
+  
+  if (store.factions.items[id]) {
+    delete store.factions.items[id];
+    store.save('remove');
+    startPollers();
+    return i.editReply({ content: '✅ Faction removed' });
+  }
+  
+  return i.editReply({ content: '❌ Not found' });
+}
+
+async function handleDelayCommand(i) {
+  const id = String(i.options.getInteger('id'));
+  const time = parseTime(i.options.getString('time')) || 0;
+  
+  const cfg = store.watchers[id];
+  if (!cfg?.travel) {
+    return i.editReply({ content: '❌ User not traveling' });
+  }
+  
+  cfg.travel.earliest = (cfg.travel.earliest || 0) + time;
+  cfg.travel.latest = (cfg.travel.latest || 0) + time;
+  store.save('delay');
+  
+  const profile = await api.getProfile(id).catch(() => null);
+  
+  return i.editReply({
+    content: `✅ Added ${formatTime(time)} delay`,
+    embeds: [Embeds.userStatus(id, profile, cfg)],
+  });
+}
+
+module.exports = {
+  handleInteraction,
+  setPollerStarter,
+};
+
+================================================================================
+
+File: src/discord/modals.js
+----------------------------------------
+const {
+    ModalBuilder,
+    ActionRowBuilder,
+    TextInputBuilder,
+    TextInputStyle,
+  } = require('discord.js');
+  const store = require('../services/store');
+  const { formatTime } = require('../utils');
+  
+  function addUser() {
+    return new ModalBuilder()
+      .setCustomId('modal:adduser:submit')
+      .setTitle('Add User to Track')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('user_id')
+            .setLabel('Torn User ID')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setPlaceholder('e.g., 12345')
+            .setMinLength(1)
+            .setMaxLength(10),
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('states')
+            .setLabel('Alert States (optional)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('jail, hospital, okay, traveling (or "all")'),
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('warn')
+            .setLabel('Early Warnings (optional)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('e.g., 5m, 2m, 30s'),
+        ),
+      );
+  }
+  
+  function addFaction() {
+    return new ModalBuilder()
+      .setCustomId('modal:addfaction:submit')
+      .setTitle('Add Faction to Track')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('faction_id')
+            .setLabel('Faction ID')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setPlaceholder('e.g., 12345')
+            .setMinLength(1)
+            .setMaxLength(10),
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('states')
+            .setLabel('Alert States (optional)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('jail, hospital, okay, traveling (or "all")'),
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('offline')
+            .setLabel('Offline Alert Hours (optional)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('e.g., 24'),
+        ),
+      );
+  }
+  
+  function chainConfig() {
+    const chain = store.self.chain;
+    
+    return new ModalBuilder()
+      .setCustomId('modal:chain:submit')
+      .setTitle('Chain Alert Settings')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('min')
+            .setLabel('Minimum Chain Length')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('e.g., 10')
+            .setValue(String(chain.min || 10)),
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('thresholds')
+            .setLabel('Alert Times (comma-separated)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('e.g., 2m, 1m, 30s')
+            .setValue(chain.thresholds?.map(formatTime).join(', ') || '2m, 1m, 30s'),
+        ),
+      );
+  }
+  
+  function userWarn(userId) {
+    const cfg = store.watchers[userId] || {};
+    
+    return new ModalBuilder()
+      .setCustomId(`modal:userwarn:${userId}:submit`)
+      .setTitle('Early Warning Alerts')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('warn')
+            .setLabel('Alert before state ends')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('e.g., 5m, 2m, 30s')
+            .setValue(cfg.preTimesSec?.map(formatTime).join(', ') || ''),
+        ),
+      );
+  }
+  
+  function factionWarn(factionId) {
+    const f = store.factions.items[factionId] || {};
+    
+    return new ModalBuilder()
+      .setCustomId(`modal:factionwarn:${factionId}:submit`)
+      .setTitle('Early Warning Alerts')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('warn')
+            .setLabel('Alert before state ends')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('e.g., 5m, 2m, 30s')
+            .setValue(f.preTimesSec?.map(formatTime).join(', ') || ''),
+        ),
+      );
+  }
+  
+  function factionOffline(factionId) {
+    const f = store.factions.items[factionId] || {};
+    
+    return new ModalBuilder()
+      .setCustomId(`modal:factionoffline:${factionId}:submit`)
+      .setTitle('Offline Alert Settings')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('hours')
+            .setLabel('Hours before alert')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('e.g., 24')
+            .setValue(String(f.offline?.hours || 24)),
+        ),
+      );
+  }
+  
+  function delay(userId) {
+    return new ModalBuilder()
+      .setCustomId(`modal:delay:${userId}:submit`)
+      .setTitle('Add Travel Delay')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('time')
+            .setLabel('Delay Time')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setPlaceholder('e.g., 5m, 30s, 1h'),
+        ),
+      );
+  }
+  
+  module.exports = {
+    addUser,
+    addFaction,
+    chainConfig,
+    userWarn,
+    factionWarn,
+    factionOffline,
+    delay,
+  };
+
+================================================================================
+
+File: src/config/constants.js
+----------------------------------------
+// ═══════════════════════════════════════════════════════════════
+// STATES & TRACKING
+// ═══════════════════════════════════════════════════════════════
+
+const STATES = ['Traveling', 'Abroad', 'Jail', 'Hospital', 'Okay'];
+const BARS = ['energy', 'nerve', 'happy', 'life'];
+const COOLDOWNS = ['drug', 'medical', 'booster', 'alcohol'];
+
+// ═══════════════════════════════════════════════════════════════
+// EMOJI MAPPINGS
+// ═══════════════════════════════════════════════════════════════
+
+const EMOJI = {
+  // States
+  Traveling: '✈️',
+  Abroad: '🗺️',
+  Jail: '🚔',
+  Hospital: '🏥',
+  Okay: '✅',
+  Unknown: '❓',
+  
+  // Bars
+  energy: '⚡',
+  nerve: '💢',
+  happy: '😊',
+  life: '❤️',
+  
+  // Cooldowns
+  drug: '💊',
+  medical: '🩹',
+  booster: '💉',
+  alcohol: '🍺',
+  
+  // UI
+  chain: '⛓️',
+  on: '🟢',
+  off: '🔴',
+  user: '👤',
+  faction: '🏴',
+  warning: '⚠️',
+  success: '✅',
+  error: '❌',
+  loading: '⏳',
+};
+
+// ═══════════════════════════════════════════════════════════════
+// COLORS
+// ═══════════════════════════════════════════════════════════════
+
+const COLORS = {
+  // States
+  Traveling: 0x3498db,
+  Abroad: 0xf39c12,
+  Jail: 0x7f8c8d,
+  Hospital: 0xe74c3c,
+  Okay: 0x2ecc71,
+  
+  // UI
+  brand: 0x5865f2,
+  warn: 0xf39c12,
+  good: 0x2ecc71,
+  bad: 0xe74c3c,
+  info: 0x3498db,
+};
+
+// ═══════════════════════════════════════════════════════════════
+// TORN LINKS
+// ═══════════════════════════════════════════════════════════════
+
+const LINKS = {
+  // Items
+  drugs: 'https://www.torn.com/item.php#drugs-items',
+  alcohol: 'https://www.torn.com/item.php#alcohol-items',
+  boosters: 'https://www.torn.com/item.php#boosters-items',
+  medical: 'https://www.torn.com/factions.php?step=your&type=1#armoury-medical',
+  
+  // Locations
+  hospital: 'https://www.torn.com/hospitalview.php',
+  jail: 'https://www.torn.com/jailview.php',
+  travel: 'https://www.torn.com/travelagency.php',
+  gym: 'https://www.torn.com/gym.php',
+  crimes: 'https://www.torn.com/crimes.php',
+  home: 'https://www.torn.com/index.php',
+  
+  // Dynamic
+  profile: (id) => `https://www.torn.com/profiles.php?XID=${id}`,
+  attack: (id) => `https://www.torn.com/loader.php?sid=attack&user2ID=${id}`,
+  faction: (id) => `https://www.torn.com/factions.php?step=profile&ID=${id}`,
+  bounty: (id) => `https://www.torn.com/bounties.php?p=add&XID=${id}`,
+  trade: (id) => `https://www.torn.com/trade.php#step=start&userID=${id}`,
+  mail: (id) => `https://www.torn.com/messages.php#/p=compose&XID=${id}`,
+};
+
+// Map cooldowns to their action links
+const COOLDOWN_LINKS = {
+  drug: LINKS.drugs,
+  medical: LINKS.medical,
+  booster: LINKS.boosters,
+  alcohol: LINKS.alcohol,
+};
+
+// Map bars to their action links
+const BAR_LINKS = {
+  energy: LINKS.gym,
+  nerve: LINKS.crimes,
+  happy: LINKS.drugs,
+  life: LINKS.hospital,
+};
+
+// ═══════════════════════════════════════════════════════════════
+// TRAVEL DATA
+// ═══════════════════════════════════════════════════════════════
+
+const DESTINATIONS = [
+  'Mexico', 'Cayman Islands', 'Canada', 'Hawaii', 
+  'United Kingdom', 'Argentina', 'Switzerland', 
+  'Japan', 'China', 'UAE', 'South Africa'
+];
+
+const TRAVEL_TIMES = {
+  standard_economy: [1560, 2100, 2460, 8040, 9540, 10020, 10500, 13500, 14520, 16260, 17820],
+  standard_business: [480, 660, 720, 2400, 2880, 3000, 3180, 4080, 4320, 4860, 5340],
+  airstrip: [1080, 1500, 1740, 5640, 6660, 7020, 7380, 9480, 10140, 11400, 12480],
+  private: [780, 1080, 1200, 4020, 4800, 4980, 5280, 6780, 7260, 8100, 8940],
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ACTION DESCRIPTIONS
+// ═══════════════════════════════════════════════════════════════
+
+const BAR_ACTIONS = {
+  energy: { text: 'Hit the gym!', link: LINKS.gym },
+  nerve: { text: 'Commit some crimes!', link: LINKS.crimes },
+  happy: { text: 'Time to boost!', link: LINKS.drugs },
+  life: { text: 'You\'re at full health!', link: LINKS.home },
+};
+
+const COOLDOWN_ACTIONS = {
+  drug: { text: 'Take some drugs!', link: LINKS.drugs },
+  medical: { text: 'Use faction medical!', link: LINKS.medical },
+  booster: { text: 'Use a booster!', link: LINKS.boosters },
+  alcohol: { text: 'Have a drink!', link: LINKS.alcohol },
+};
+
+module.exports = {
+  STATES,
+  BARS,
+  COOLDOWNS,
+  EMOJI,
+  COLORS,
+  LINKS,
+  COOLDOWN_LINKS,
+  BAR_LINKS,
+  DESTINATIONS,
+  TRAVEL_TIMES,
+  BAR_ACTIONS,
+  COOLDOWN_ACTIONS,
+};
+
+
+================================================================================
+
+File: src/config/index.js
+----------------------------------------
+
+require('dotenv').config();
+
+const config = {
+  discord: {
+    token: process.env.DISCORD_TOKEN,
+    ownerId: process.env.OWNER_DISCORD_ID,
+    guildId: process.env.GUILD_ID || null,
+  },
+  
+  torn: {
+    apiKey: process.env.TORN_API_KEY,
+    userIds: process.env.USER_IDS || '',
+    factionIds: process.env.FACTION_IDS || '',
+  },
+  
+  timing: {
+    requestMs: Number(process.env.REQUEST_INTERVAL_MS) || 5000,
+    factionMs: Number(process.env.FACTION_INTERVAL_MS) || 30000,
+    barsMs: 60000,
+    chainMs: 10000,
+  },
+  
+  persist: process.env.PERSIST_PATH || './data/store.json',
+  port: Number(process.env.PORT) || 3000,
+  
+  defaults: {
+    offlineHours: Number(process.env.FACTION_OFFLINE_HOURS) || 24,
+  },
+};
+
+// Validation
+const required = [
+  ['discord.token', config.discord.token],
+  ['discord.ownerId', config.discord.ownerId],
+  ['torn.apiKey', config.torn.apiKey],
+];
+
+for (const [name, value] of required) {
+  if (!value) {
+    throw new Error(`Missing required config: ${name}`);
+  }
+}
+
+module.exports = config;
+
+
+================================================================================

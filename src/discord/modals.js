@@ -159,6 +159,25 @@ const {
         ),
       );
   }
+
+  function addictionConfig() {
+    const addiction = store.self.addiction;
+    
+    return new ModalBuilder()
+      .setCustomId('modal:addiction:submit')
+      .setTitle('Addiction Alert Settings')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('threshold')
+            .setLabel('Alert when addiction reaches (negative)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('e.g., -5')
+            .setValue(String(addiction.threshold || -5)),
+        ),
+      );
+  }
   
   function delay(userId) {
     return new ModalBuilder()
@@ -184,4 +203,5 @@ const {
     factionWarn,
     factionOffline,
     delay,
+    addictionConfig,
   };

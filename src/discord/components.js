@@ -129,57 +129,81 @@ const {
   // ALERTS CONFIG
   // ═══════════════════════════════════════════════════════════════
   
-  function alertsButtons() {
-    const { self } = store.data;
-    
-    const barRow = new ActionRowBuilder().addComponents(
-      ...BARS.map(b =>
-        new ButtonBuilder()
-          .setCustomId(`toggle:bar:${b}`)
-          .setLabel(capitalize(b))
-          .setEmoji(EMOJI[b])
-          .setStyle(self.bars[b] ? ButtonStyle.Success : ButtonStyle.Secondary),
-      ),
-    );
-    
-    const cdRow = new ActionRowBuilder().addComponents(
-      ...COOLDOWNS.map(c =>
-        new ButtonBuilder()
-          .setCustomId(`toggle:cd:${c}`)
-          .setLabel(capitalize(c))
-          .setEmoji(EMOJI[c])
-          .setStyle(self.cooldowns[c] ? ButtonStyle.Success : ButtonStyle.Secondary),
-      ),
-    );
-    
-    const chainRow = new ActionRowBuilder().addComponents(
+  // ... in alertsButtons function, add these rows:
+
+function alertsButtons() {
+  const { self } = store.data;
+  
+  const barRow = new ActionRowBuilder().addComponents(
+    ...BARS.map(b =>
       new ButtonBuilder()
-        .setCustomId('toggle:chain')
-        .setLabel('Chain Alerts')
-        .setEmoji(EMOJI.chain)
-        .setStyle(self.chain.enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
+        .setCustomId(`toggle:bar:${b}`)
+        .setLabel(capitalize(b))
+        .setEmoji(EMOJI[b])
+        .setStyle(self.bars[b] ? ButtonStyle.Success : ButtonStyle.Secondary),
+    ),
+  );
+  
+  const cdRow = new ActionRowBuilder().addComponents(
+    ...COOLDOWNS.map(c =>
       new ButtonBuilder()
-        .setCustomId('modal:chain')
-        .setLabel('Configure')
-        .setEmoji('⚙️')
-        .setStyle(ButtonStyle.Primary),
-    );
-    
-    const navRow = new ActionRowBuilder().addComponents(
+        .setCustomId(`toggle:cd:${c}`)
+        .setLabel(capitalize(c))
+        .setEmoji(EMOJI[c])
+        .setStyle(self.cooldowns[c] ? ButtonStyle.Success : ButtonStyle.Secondary),
+    ),
+  );
+  
+  // NEW: Icons row
+  const iconKeys = ['racing', 'oc', 'bank', 'education'];
+  const iconRow = new ActionRowBuilder().addComponents(
+    ...iconKeys.map(k =>
       new ButtonBuilder()
-        .setCustomId('dash:main')
-        .setLabel('Back')
-        .setEmoji('◀️')
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId('alerts:refresh')
-        .setLabel('Refresh Data')
-        .setEmoji('🔄')
-        .setStyle(ButtonStyle.Primary),
-    );
-    
-    return [barRow, cdRow, chainRow, navRow];
-  }
+        .setCustomId(`toggle:icon:${k}`)
+        .setLabel(capitalize(k))
+        .setEmoji(EMOJI[k])
+        .setStyle(self.icons[k] ? ButtonStyle.Success : ButtonStyle.Secondary),
+    ),
+  );
+  
+  const chainRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('toggle:chain')
+      .setLabel('Chain')
+      .setEmoji(EMOJI.chain)
+      .setStyle(self.chain.enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('modal:chain')
+      .setLabel('Config')
+      .setEmoji('⚙️')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('toggle:addiction')
+      .setLabel('Addiction')
+      .setEmoji(EMOJI.addiction)
+      .setStyle(self.addiction.enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('modal:addiction')
+      .setLabel('Config')
+      .setEmoji('⚙️')
+      .setStyle(ButtonStyle.Primary),
+  );
+  
+  const navRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('dash:main')
+      .setLabel('Back')
+      .setEmoji('◀️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('alerts:refresh')
+      .setLabel('Refresh Data')
+      .setEmoji('🔄')
+      .setStyle(ButtonStyle.Primary),
+  );
+  
+  return [barRow, cdRow, iconRow, chainRow, navRow];
+}
   
   // ═══════════════════════════════════════════════════════════════
   // USER CONFIG

@@ -2,12 +2,15 @@ const store = require('../services/store');
 const api = require('../services/api');
 const { notify } = require('../services/notify');
 const Embeds = require('../discord/embeds');
-const { BARS, COOLDOWNS } = require('../config/constants');
+const { BARS, COOLDOWNS, TRACKABLE_ICONS } = require('../config/constants');
+const { pollIcons, getCooldownRemaining } = require('./icons');
+const { pollCompany } = require('./company');
 const config = require('../config');
 
 let barsTimer = null;
 let chainTimer = null;
-let cooldownTimer = null;
+let iconsTimer = null;
+let companyTimer = null;
 
 // ═══════════════════════════════════════════════════════════════
 // BAR POLLING
@@ -98,61 +101,6 @@ async function pollChain() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// COOLDOWN POLLING
-// ═══════════════════════════════════════════════════════════════
-
-async function pollCooldowns() {
-  try {
-    const cooldowns = await api.getCooldowns();
-    const { self } = store.data;
-    
-    let soonestExpiry = Infinity;
-    
-    for (const cd of COOLDOWNS) {
-      if (!self.cooldowns[cd]) continue;
-      
-      const prev = self.cooldowns.last[cd] || 0;
-      const current = cooldowns[cd] ?? 0;
-      
-      self.cooldowns.last[cd] = current;
-      
-      // Alert if just became ready (was >0, now 0)
-      if (prev > 0 && current <= 0) {
-        await notify(Embeds.cooldownReady(cd));
-      }
-      
-      // Track soonest expiry for smart scheduling
-      if (current > 0) {
-        soonestExpiry = Math.min(soonestExpiry, current);
-      }
-    }
-    
-    store.save('cooldowns');
-    
-    // Schedule next poll based on soonest expiry
-    const nextPoll = soonestExpiry < Infinity 
-      ? (soonestExpiry + 2) * 1000  // 2 second buffer
-      : 30 * 60 * 1000;             // 30 minutes default
-    
-    scheduleCooldownPoll(nextPoll);
-    
-  } catch (error) {
-    console.warn('[cooldowns]', error.message);
-    // Retry in 5 minutes on error
-    scheduleCooldownPoll(5 * 60 * 1000);
-  }
-}
-
-function scheduleCooldownPoll(ms) {
-  clearTimeout(cooldownTimer);
-  
-  const hasActiveCooldowns = COOLDOWNS.some(c => store.self.cooldowns[c]);
-  if (!hasActiveCooldowns) return;
-  
-  cooldownTimer = setTimeout(pollCooldowns, Math.max(2000, ms));
-}
-
-// ═══════════════════════════════════════════════════════════════
 // START/STOP
 // ═══════════════════════════════════════════════════════════════
 
@@ -163,6 +111,8 @@ function startSelfPollers() {
   const hasBars = BARS.some(b => self.bars[b]);
   const hasChain = self.chain.enabled;
   const hasCooldowns = COOLDOWNS.some(c => self.cooldowns[c]);
+  const hasIcons = Object.keys(TRACKABLE_ICONS).some(k => self.icons[k]);
+  const hasAddiction = self.addiction.enabled;
   
   // Bars polling
   if (hasBars || hasChain) {
@@ -177,27 +127,38 @@ function startSelfPollers() {
     chainTimer = setInterval(pollChain, config.timing.chainMs);
   }
   
-  // Cooldowns polling (smart scheduling)
-  if (hasCooldowns) {
-    console.log('[self] Starting cooldowns polling');
-    pollCooldowns();
+  // Icons polling (cooldowns + trackable icons)
+  if (hasCooldowns || hasIcons) {
+    console.log('[self] Starting icons polling');
+    iconsTimer = setInterval(pollIcons, config.timing.iconsMs || 30000);
+    pollIcons();
+  }
+  
+  // Company polling (addiction)
+  if (hasAddiction) {
+    console.log('[self] Starting company polling');
+    companyTimer = setInterval(pollCompany, config.timing.companyMs || 60000);
+    pollCompany();
   }
 }
 
 function stopSelfPollers() {
   clearInterval(barsTimer);
   clearInterval(chainTimer);
-  clearTimeout(cooldownTimer);
+  clearInterval(iconsTimer);
+  clearInterval(companyTimer);
   
   barsTimer = null;
   chainTimer = null;
-  cooldownTimer = null;
+  iconsTimer = null;
+  companyTimer = null;
 }
 
 module.exports = {
   pollBars,
   pollChain,
-  pollCooldowns,
+  pollIcons,
+  pollCompany,
   startSelfPollers,
   stopSelfPollers,
 };

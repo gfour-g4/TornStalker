@@ -4,8 +4,7 @@ const config = require('../config');
 class TornAPI {
   constructor(apiKey) {
     this.key = apiKey;
-    this.requestCount = 0;
-    this.lastRequest = 0;
+    this.ownerId = null; // Will be set on validation
     
     // V2 API client
     this.v2 = axios.create({
@@ -59,6 +58,16 @@ class TornAPI {
     return data.profile;
   }
 
+  async getOwnProfile() {
+    const { data } = await this.v2.get('/user/basic');
+    
+    if (!data?.profile) {
+      throw new Error('Invalid own profile response');
+    }
+    
+    return data.profile;
+  }
+
   async getBars() {
     const { data } = await this.v1.get('/user/', {
       params: { selections: 'bars' },
@@ -69,6 +78,16 @@ class TornAPI {
     }
     
     return data;
+  }
+
+  async getIcons() {
+    const { data } = await this.v2.get('/user/icons');
+    
+    if (!data?.icons) {
+      throw new Error('Invalid icons response');
+    }
+    
+    return data.icons;
   }
 
   async getCooldowns() {
@@ -89,6 +108,22 @@ class TornAPI {
     });
     
     return data?.chain || null;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Company Endpoints
+  // ─────────────────────────────────────────────────────────────
+
+  async getCompanyEmployees() {
+    const { data } = await this.v1.get('/company/', {
+      params: { selections: 'employees' },
+    });
+    
+    if (!data?.company_employees) {
+      throw new Error('Invalid company employees response');
+    }
+    
+    return data.company_employees;
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -121,13 +156,21 @@ class TornAPI {
 
   async validateKey() {
     try {
-      const { data } = await this.v1.get('/user/', {
-        params: { selections: 'basic' },
-      });
-      return { valid: true, name: data.name, level: data.level };
+      const profile = await this.getOwnProfile();
+      this.ownerId = profile.id;
+      return { 
+        valid: true, 
+        id: profile.id,
+        name: profile.name, 
+        level: profile.level,
+      };
     } catch (e) {
       return { valid: false, error: e.message };
     }
+  }
+
+  getOwnerId() {
+    return this.ownerId;
   }
 }
 
