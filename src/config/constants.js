@@ -7,78 +7,6 @@ const BARS = ['energy', 'nerve', 'happy', 'life'];
 const COOLDOWNS = ['drug', 'medical', 'booster', 'alcohol'];
 
 // ═══════════════════════════════════════════════════════════════
-// ICON IDS (Data-driven, no string parsing needed!)
-// ═══════════════════════════════════════════════════════════════
-
-const ICON_IDS = {
-  // Cooldowns
-  DRUG: 52,
-  MEDICAL: 47,
-  BOOSTER: 42,
-  ALCOHOL: 48,
-  
-  // Activities
-  RACING_ACTIVE: 17,
-  RACING_FINISHED: 18,
-  OC: 85,
-  EDUCATION: 19,
-  
-  // Financial
-  BANK_INVESTMENT: 29,
-  STOCK_MARKET: 38,
-  LOAN: 33,
-  OFFSHORE: 31,
-  
-  // Status
-  DONATOR: 3,
-  FACTION: 9,
-  COMPANY: 27,
-  MARRIED: 8,
-  
-  // Gender
-  MALE: 6,
-  FEMALE: 7,
-};
-
-// Map cooldown names to icon IDs
-const COOLDOWN_ICON_MAP = {
-  drug: ICON_IDS.DRUG,
-  medical: ICON_IDS.MEDICAL,
-  booster: ICON_IDS.BOOSTER,
-  alcohol: ICON_IDS.ALCOHOL,
-};
-
-// Trackable icon events
-const TRACKABLE_ICONS = {
-  racing: { 
-    startId: ICON_IDS.RACING_ACTIVE, 
-    endId: ICON_IDS.RACING_FINISHED,
-    name: 'Racing',
-    emoji: '🏎️',
-  },
-  oc: { 
-    id: ICON_IDS.OC, 
-    name: 'Organized Crime',
-    emoji: '🎭',
-  },
-  bank: { 
-    id: ICON_IDS.BANK_INVESTMENT, 
-    name: 'Bank Investment',
-    emoji: '🏦',
-  },
-  education: { 
-    id: ICON_IDS.EDUCATION, 
-    name: 'Education',
-    emoji: '📚',
-  },
-  donator: { 
-    id: ICON_IDS.DONATOR, 
-    name: 'Donator',
-    emoji: '⭐',
-  },
-};
-
-// ═══════════════════════════════════════════════════════════════
 // EMOJI MAPPINGS
 // ═══════════════════════════════════════════════════════════════
 
@@ -102,15 +30,6 @@ const EMOJI = {
   medical: '🩹',
   booster: '💉',
   alcohol: '🍺',
-  
-  // Icons/Activities
-  racing: '🏎️',
-  oc: '🎭',
-  bank: '🏦',
-  education: '📚',
-  donator: '⭐',
-  addiction: '😵',
-  company: '🏢',
   
   // UI
   chain: '⛓️',
@@ -162,11 +81,6 @@ const LINKS = {
   gym: 'https://www.torn.com/gym.php',
   crimes: 'https://www.torn.com/crimes.php',
   home: 'https://www.torn.com/index.php',
-  racing: 'https://www.torn.com/loader.php?sid=racing',
-  oc: 'https://www.torn.com/factions.php?step=your&type=1#/tab=crimes',
-  bank: 'https://www.torn.com/bank.php',
-  education: 'https://www.torn.com/education.php',
-  company: 'https://www.torn.com/companies.php',
   
   // Dynamic
   profile: (id) => `https://www.torn.com/profiles.php?XID=${id}`,
@@ -228,21 +142,10 @@ const COOLDOWN_ACTIONS = {
   alcohol: { text: 'Have a drink!', link: LINKS.alcohol },
 };
 
-const ICON_ACTIONS = {
-  racing: { text: 'Race started!', link: LINKS.racing },
-  oc: { text: 'Organized crime joined!', link: LINKS.oc },
-  bank: { text: 'Bank investment made!', link: LINKS.bank },
-  education: { text: 'Course started!', link: LINKS.education },
-  donator: { text: 'Donator status updated!', link: LINKS.home },
-};
-
 module.exports = {
   STATES,
   BARS,
   COOLDOWNS,
-  ICON_IDS,
-  COOLDOWN_ICON_MAP,
-  TRACKABLE_ICONS,
   EMOJI,
   COLORS,
   LINKS,
@@ -252,5 +155,4 @@ module.exports = {
   TRAVEL_TIMES,
   BAR_ACTIONS,
   COOLDOWN_ACTIONS,
-  ICON_ACTIONS,
 };

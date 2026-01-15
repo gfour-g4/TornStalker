@@ -71,18 +71,13 @@ async function initialize() {
   // Seed from environment if empty
   seedFromEnv();
   
-  // Validate API key and get owner ID
+  // Validate API key
   const keyCheck = await api.validateKey();
   if (!keyCheck.valid) {
     console.error('[api] Invalid API key:', keyCheck.error);
     process.exit(1);
   }
-  
-  // Store owner ID for company lookups
-  store.ownerId = keyCheck.id;
-  store.save('owner-id');
-  
-  console.log(`[api] Connected as ${keyCheck.name} [${keyCheck.id}] (Level ${keyCheck.level})`);
+  console.log(`[api] Connected as ${keyCheck.name} (Level ${keyCheck.level})`);
 }
 
 function seedFromEnv() {

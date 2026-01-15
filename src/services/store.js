@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const config = require('../config');
-const { STATES, BARS, COOLDOWNS, TRACKABLE_ICONS } = require('../config/constants');
+const { STATES, BARS, COOLDOWNS } = require('../config/constants');
 
 class Store {
   constructor(filePath) {
@@ -30,8 +30,7 @@ class Store {
 
   _defaultData() {
     return {
-      version: 3,
-      ownerId: null,
+      version: 2,
       requestMs: config.timing.requestMs,
       watchers: {},
       self: this._selfDefaults(),
@@ -50,20 +49,8 @@ class Store {
         wasFull: {},
       },
       cooldowns: {
-        // Whether to track each cooldown
         ...Object.fromEntries(COOLDOWNS.map(c => [c, false])),
-        // Last seen icon data for each cooldown (by icon ID)
-        lastIcons: {},
-        // Which cooldowns were ready (no icon present)
-        wasReady: {},
-      },
-      icons: {
-        // Which icon types to track
-        ...Object.fromEntries(Object.keys(TRACKABLE_ICONS).map(k => [k, false])),
-        // Last seen icon data (by icon ID)
         last: {},
-        // Notified flags to avoid spam
-        notified: {},
       },
       chain: {
         enabled: false,
@@ -72,12 +59,6 @@ class Store {
         last: {},
         epochId: 0,
         fired: {},
-      },
-      addiction: {
-        enabled: false,
-        threshold: -5,
-        last: null,
-        notified: false,
       },
     };
   }
@@ -109,17 +90,9 @@ class Store {
             ...this._selfDefaults().cooldowns,
             ...loaded.self?.cooldowns,
           },
-          icons: {
-            ...this._selfDefaults().icons,
-            ...loaded.self?.icons,
-          },
           chain: {
             ...this._selfDefaults().chain,
             ...loaded.self?.chain,
-          },
-          addiction: {
-            ...this._selfDefaults().addiction,
-            ...loaded.self?.addiction,
           },
         },
         factions: {
@@ -188,14 +161,6 @@ class Store {
     this.data.requestMs = value;
   }
 
-  get ownerId() {
-    return this.data.ownerId;
-  }
-
-  set ownerId(value) {
-    this.data.ownerId = value;
-  }
-
   // ─────────────────────────────────────────────────────────────
   // User Methods
   // ─────────────────────────────────────────────────────────────
@@ -251,7 +216,6 @@ class Store {
   getStats() {
     const users = Object.entries(this.watchers);
     const factions = Object.entries(this.factions.items);
-    const { icons } = this.self;
     
     return {
       users: {
@@ -269,9 +233,7 @@ class Store {
       alerts: {
         bars: BARS.filter(b => this.self.bars[b]).length,
         cooldowns: COOLDOWNS.filter(c => this.self.cooldowns[c]).length,
-        icons: Object.keys(TRACKABLE_ICONS).filter(k => icons[k]).length,
         chain: this.self.chain.enabled,
-        addiction: this.self.addiction.enabled,
       },
     };
   }

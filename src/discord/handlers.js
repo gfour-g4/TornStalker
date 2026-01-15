@@ -309,28 +309,6 @@ async function handleButton(i) {
           components: Components.alertsButtons(),
         });
       }
-
-      case 'icon': {
-        store.self.icons[id] = !store.self.icons[id];
-        store.save('toggle-icon');
-        startPollers();
-        
-        return i.editReply({
-          embeds: [Embeds.alertsConfig()],
-          components: Components.alertsButtons(),
-        });
-      }
-      
-      case 'addiction': {
-        store.self.addiction.enabled = !store.self.addiction.enabled;
-        store.save('toggle-addiction');
-        startPollers();
-        
-        return i.editReply({
-          embeds: [Embeds.alertsConfig()],
-          components: Components.alertsButtons(),
-        });
-      }
       
       case 'chain': {
         store.self.chain.enabled = !store.self.chain.enabled;
