@@ -165,6 +165,25 @@ const {
         .setStyle(ButtonStyle.Primary),
     );
     
+    // Combine addiction and racing into one row to stay within Discord's 5-row limit
+    const addictionRacingRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('toggle:addiction')
+        .setLabel('Addiction Check')
+        .setEmoji('⚠️')
+        .setStyle((self.addiction.dailyCheck?.enabled) ? ButtonStyle.Success : ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('modal:addiction')
+        .setLabel('Configure')
+        .setEmoji('⚙️')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('toggle:racing')
+        .setLabel('Racing Reminders')
+        .setEmoji('🏎️')
+        .setStyle(self.racing.enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
+    );
+    
     const navRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId('dash:main')
@@ -178,7 +197,7 @@ const {
         .setStyle(ButtonStyle.Primary),
     );
     
-    return [barRow, cdRow, chainRow, navRow];
+    return [barRow, cdRow, chainRow, addictionRacingRow, navRow];
   }
   
   // ═══════════════════════════════════════════════════════════════

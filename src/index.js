@@ -9,7 +9,7 @@ const api = require('./services/api');
 const { setClient } = require('./services/notify');
 const { handleInteraction, setPollerStarter } = require('./discord/handlers');
 const commands = require('./discord/commands');
-const { startPollers, stopPollers, scheduleDailyDigest } = require('./pollers');
+const { startPollers, stopPollers, scheduleDailyDigest, scheduleAddictionCheck } = require('./pollers');
 const { createTravelInfo } = require('./utils/travel');
 const { sleep } = require('./utils/format');
 const { STATES } = require('./config/constants');
@@ -184,6 +184,9 @@ client.once('ready', async () => {
   
   // Schedule daily faction digest
   scheduleDailyDigest();
+  
+  // Schedule daily addiction check
+  scheduleAddictionCheck();
   
   // Status summary
   const stats = store.getStats();

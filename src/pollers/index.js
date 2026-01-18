@@ -155,6 +155,103 @@ async function runDailyDigest() {
   scheduleDailyDigest();
 }
 
+// ═══════════════════════════════════════════════════════════════
+// DAILY ADDICTION CHECK
+// ═══════════════════════════════════════════════════════════════
+
+let addictionCheckTimer = null;
+
+function scheduleAddictionCheck() {
+  const { addiction } = store.self;
+  
+  if (!addiction.dailyCheck?.enabled) {
+    return;
+  }
+  
+  const now = new Date();
+  const hour = addiction.dailyCheck.hour ?? 18;
+  const minute = addiction.dailyCheck.minute ?? 10;
+  
+  // Calculate next occurrence at the specified hour:minute
+  let next = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    hour,
+    minute,
+    0
+  ));
+  
+  // If it's already past today's check time, schedule for tomorrow
+  if (next <= now) {
+    next = new Date(Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate() + 1,
+      hour,
+      minute,
+      0
+    ));
+  }
+  
+  const delay = next - now;
+  
+  clearTimeout(addictionCheckTimer);
+  addictionCheckTimer = setTimeout(runAddictionCheck, delay);
+  
+  console.log(`[addiction-check] Scheduled for ${next.toISOString()}`);
+}
+
+async function runAddictionCheck() {
+  const api = require('../services/api');
+  const { notify } = require('../services/notify');
+  const Embeds = require('../discord/embeds');
+  
+  const { addiction } = store.self;
+  
+  if (!addiction.dailyCheck?.enabled) {
+    return;
+  }
+  
+  console.log('[addiction-check] Running check...');
+  
+  try {
+    const ownerId = await api.getOwnerId();
+    if (!ownerId) {
+      console.warn('[addiction-check] Owner ID not set');
+      scheduleAddictionCheck();
+      return;
+    }
+    
+    const employees = await api.getCompanyEmployees();
+    const self = employees[String(ownerId)];
+    
+    if (!self) {
+      console.warn('[addiction-check] Self not found in company employees');
+      scheduleAddictionCheck();
+      return;
+    }
+    
+    const currentAddiction = self.effectiveness?.addiction ?? 0;
+    const threshold = addiction.threshold ?? -5;
+    
+    if (currentAddiction <= threshold) {
+      await notify(Embeds.addictionRehabAlert(currentAddiction, threshold));
+      console.log(`[addiction-check] Alert sent: ${currentAddiction} <= ${threshold}`);
+    }
+    
+  } catch (error) {
+    if (error.message.includes('company')) {
+      console.log('[addiction-check] Not in a company');
+    } else {
+      console.warn('[addiction-check]', error.message);
+    }
+  }
+  
+  // Schedule next
+  scheduleAddictionCheck();
+}
+
 module.exports = {
   Poller,
   userPoller,
@@ -162,4 +259,5 @@ module.exports = {
   startPollers,
   stopPollers,
   scheduleDailyDigest,
+  scheduleAddictionCheck,
 };

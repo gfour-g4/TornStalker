@@ -8,6 +8,7 @@ const config = require('../config');
 let barsTimer = null;
 let chainTimer = null;
 let cooldownTimer = null;
+let racingTimer = null;
 
 // ═══════════════════════════════════════════════════════════════
 // BAR POLLING
@@ -153,6 +154,66 @@ function scheduleCooldownPoll(ms) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// RACING POLLING
+// ═══════════════════════════════════════════════════════════════
+
+async function pollRacing() {
+  const { self } = store.data;
+  
+  if (!self.racing.enabled) return;
+  
+  try {
+    const log = await api.getRacingLog();
+    const { racing } = store.data.self;
+    
+    const events = Object.values(log);
+    const now = Math.floor(Date.now() / 1000);
+    
+    // 1. Handle no logs (New account or API error)
+    // Assume not in race, but ensure we don't spam if history is empty
+    if (events.length === 0) {
+      if ((now - (racing.lastNotify || 0)) > 60 * 60) {
+        await notify(Embeds.racingJoinReminder());
+        racing.lastNotify = now;
+        racing.inRace = false;
+        store.save('racing');
+      }
+      return;
+    }
+    
+    // 2. Sort by timestamp descending (newest first)
+    events.sort((a, b) => b.timestamp - a.timestamp);
+    const latest = events[0];
+    
+    // 3. Check status based on latest event
+    // Join codes: 8711 (Custom), 8715 (Official)
+    const isRacing = latest.log === 8711 || latest.log === 8715;
+    
+    const prevInRace = racing.inRace;
+    racing.inRace = isRacing;
+    racing.lastChecked = now;
+    
+    // 4. Notify if we need to join a race
+    if (!isRacing) {
+      const lastNotify = racing.lastNotify || 0;
+      
+      // Notify if:
+      // A. We were previously marked as racing (immediate notification upon finish)
+      // B. We haven't notified in over 1 hour (periodic reminder)
+      if (prevInRace || (now - lastNotify) > 60 * 60) {
+        await notify(Embeds.racingJoinReminder());
+        racing.lastNotify = now;
+        console.log(`[racing] Race finished/idle. Last event: ${latest.title} (${latest.timestamp}). Sent reminder.`);
+      }
+    }
+    
+    store.save('racing');
+  } catch (error) {
+    console.warn('[racing]', error.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // START/STOP
 // ═══════════════════════════════════════════════════════════════
 
@@ -163,6 +224,7 @@ function startSelfPollers() {
   const hasBars = BARS.some(b => self.bars[b]);
   const hasChain = self.chain.enabled;
   const hasCooldowns = COOLDOWNS.some(c => self.cooldowns[c]);
+  const hasRacing = self.racing.enabled;
   
   // Bars polling
   if (hasBars || hasChain) {
@@ -182,22 +244,32 @@ function startSelfPollers() {
     console.log('[self] Starting cooldowns polling');
     pollCooldowns();
   }
+  
+  // Racing polling (check every 5 minutes)
+  if (hasRacing) {
+    console.log('[self] Starting racing polling');
+    racingTimer = setInterval(pollRacing, 5 * 60 * 1000);
+    pollRacing(); // Initial check
+  }
 }
 
 function stopSelfPollers() {
   clearInterval(barsTimer);
   clearInterval(chainTimer);
   clearTimeout(cooldownTimer);
+  clearInterval(racingTimer);
   
   barsTimer = null;
   chainTimer = null;
   cooldownTimer = null;
+  racingTimer = null;
 }
 
 module.exports = {
   pollBars,
   pollChain,
   pollCooldowns,
+  pollRacing,
   startSelfPollers,
   stopSelfPollers,
 };

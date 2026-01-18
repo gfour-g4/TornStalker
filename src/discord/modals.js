@@ -176,6 +176,44 @@ const {
       );
   }
   
+  function addictionConfig() {
+    const addiction = store.self.addiction;
+    const dailyCheck = addiction.dailyCheck || {};
+    
+    return new ModalBuilder()
+      .setCustomId('modal:addiction:submit')
+      .setTitle('Addiction Check Settings')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('threshold')
+            .setLabel('Addiction Threshold')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('e.g., -5 (negative number)')
+            .setValue(String(addiction.threshold ?? -5)),
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('hour')
+            .setLabel('Check Hour (0-23, Torn time/UTC)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('e.g., 18 for 6pm')
+            .setValue(String(dailyCheck.hour ?? 18)),
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('minute')
+            .setLabel('Check Minute (0-59)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('e.g., 10')
+            .setValue(String(dailyCheck.minute ?? 10)),
+        ),
+      );
+  }
+  
   module.exports = {
     addUser,
     addFaction,
@@ -184,4 +222,5 @@ const {
     factionWarn,
     factionOffline,
     delay,
+    addictionConfig,
   };

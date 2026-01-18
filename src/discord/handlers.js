@@ -154,6 +154,39 @@ async function handleModal(i, ephemeral) {
       });
     }
     
+    case 'addiction': {
+      const threshold = parseInt(i.fields.getTextInputValue('threshold'));
+      const hour = parseInt(i.fields.getTextInputValue('hour'));
+      const minute = parseInt(i.fields.getTextInputValue('minute'));
+      
+      if (!isNaN(threshold)) {
+        store.self.addiction.threshold = threshold;
+      }
+      
+      if (!store.self.addiction.dailyCheck) {
+        store.self.addiction.dailyCheck = { enabled: true, hour: 18, minute: 10 };
+      }
+      
+      if (!isNaN(hour) && hour >= 0 && hour <= 23) {
+        store.self.addiction.dailyCheck.hour = hour;
+      }
+      
+      if (!isNaN(minute) && minute >= 0 && minute <= 59) {
+        store.self.addiction.dailyCheck.minute = minute;
+      }
+      
+      store.save('addiction-config');
+      
+      // Reschedule the addiction check with new time
+      const { scheduleAddictionCheck } = require('../pollers');
+      scheduleAddictionCheck();
+      
+      return i.editReply({
+        embeds: [Embeds.alertsConfig()],
+        components: Components.alertsButtons(),
+      });
+    }
+    
     case 'userwarn': {
       const warn = parseTimes(i.fields.getTextInputValue('warn'));
       const cfg = store.watchers[id];
@@ -272,6 +305,8 @@ async function handleButton(i) {
         return i.showModal(Modals.addFaction());
       case 'chain':
         return i.showModal(Modals.chainConfig());
+      case 'addiction':
+        return i.showModal(Modals.addictionConfig());
       case 'userwarn':
         return i.showModal(Modals.userWarn(id));
       case 'factionwarn':
@@ -313,6 +348,35 @@ async function handleButton(i) {
       case 'chain': {
         store.self.chain.enabled = !store.self.chain.enabled;
         store.save('toggle-chain');
+        startPollers();
+        
+        return i.editReply({
+          embeds: [Embeds.alertsConfig()],
+          components: Components.alertsButtons(),
+        });
+      }
+      
+      case 'addiction': {
+        const { addiction } = store.self;
+        if (!addiction.dailyCheck) {
+          addiction.dailyCheck = { enabled: true, hour: 18, minute: 10 };
+        }
+        addiction.dailyCheck.enabled = !addiction.dailyCheck.enabled;
+        store.save('toggle-addiction');
+        
+        // Schedule/reschedule the addiction check
+        const { scheduleAddictionCheck } = require('../pollers');
+        scheduleAddictionCheck();
+        
+        return i.editReply({
+          embeds: [Embeds.alertsConfig()],
+          components: Components.alertsButtons(),
+        });
+      }
+      
+      case 'racing': {
+        store.self.racing.enabled = !store.self.racing.enabled;
+        store.save('toggle-racing');
         startPollers();
         
         return i.editReply({

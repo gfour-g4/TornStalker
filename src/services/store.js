@@ -60,6 +60,24 @@ class Store {
         epochId: 0,
         fired: {},
       },
+      addiction: {
+        enabled: false,
+        threshold: -10,
+        dailyCheck: {
+          enabled: true,
+          hour: 18, // 6:10pm Torn time (UTC)
+          minute: 10,
+        },
+        last: null,
+        notified: false,
+      },
+      racing: {
+        enabled: false,
+        lastChecked: null,
+        inRace: false,
+        lastRaceJoin: null,
+        lastNotify: null,
+      },
     };
   }
 
@@ -93,6 +111,18 @@ class Store {
           chain: {
             ...this._selfDefaults().chain,
             ...loaded.self?.chain,
+          },
+          addiction: {
+            ...this._selfDefaults().addiction,
+            ...loaded.self?.addiction,
+            dailyCheck: {
+              ...this._selfDefaults().addiction.dailyCheck,
+              ...loaded.self?.addiction?.dailyCheck,
+            },
+          },
+          racing: {
+            ...this._selfDefaults().racing,
+            ...loaded.self?.racing,
           },
         },
         factions: {

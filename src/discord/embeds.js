@@ -297,14 +297,29 @@ function alertsConfig() {
     ? `${EMOJI.on} **Enabled**\n┗ Min: **${chain.min}** • Alerts: ${chain.thresholds.map(formatTime).join(', ')}`
     : `${EMOJI.off} **Disabled**`;
   
+  // Addiction config
+  const addiction = self.addiction;
+  const addictionDailyCheck = addiction.dailyCheck || {};
+  const addictionLine = addiction.dailyCheck?.enabled
+    ? `${EMOJI.on} **Enabled**\n┗ Threshold: **${addiction.threshold ?? -5}** • Check: **${String(addictionDailyCheck.hour ?? 18).padStart(2, '0')}:${String(addictionDailyCheck.minute ?? 10).padStart(2, '0')}** Torn time`
+    : `${EMOJI.off} **Disabled**`;
+  
+  // Racing config
+  const racing = self.racing;
+  const racingLine = racing.enabled
+    ? `${EMOJI.on} **Enabled**\n┗ Reminds you to join a race when not in one`
+    : `${EMOJI.off} **Disabled**`;
+  
   return new EmbedBuilder()
     .setColor(COLORS.brand)
     .setTitle('🔔 Personal Alerts')
-    .setDescription('Get notified when your bars fill or cooldowns expire.')
+    .setDescription('Get notified when your bars fill, cooldowns expire, or other events occur.')
     .addFields(
       { name: '⚡ Bar Alerts (full)', value: barLines.join('\n\n'), inline: false },
       { name: '💊 Cooldown Alerts (ready)', value: cdLines.join('\n\n'), inline: false },
       { name: '⛓️ Chain Alerts', value: chainLine, inline: false },
+      { name: '⚠️ Addiction Daily Check', value: addictionLine, inline: false },
+      { name: '🏎️ Racing Reminders', value: racingLine, inline: false },
     )
     .setFooter({ text: 'Toggle with buttons below' })
     .setTimestamp();
@@ -430,6 +445,44 @@ function chainAlert(chain, threshold) {
       bar,
       '',
       urgent ? '⚠️ **CHAIN ABOUT TO DROP!**' : `Alert at: ${formatTime(threshold)}`,
+    ].join('\n'))
+    .setTimestamp();
+}
+
+function addictionRehabAlert(addiction, threshold) {
+  // Calculate tomorrow 4pm Torn time (UTC)
+  const now = new Date();
+  const tomorrow = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1,
+    16, 0, 0 // 4:00pm UTC
+  ));
+  const tomorrowTimestamp = Math.floor(tomorrow.getTime() / 1000);
+  
+  return new EmbedBuilder()
+    .setColor(COLORS.warn)
+    .setTitle('⚠️ Company Addiction Alert')
+    .setDescription([
+      `**Current Addiction:** ${addiction}`,
+      `**Threshold:** ${threshold}`,
+      '',
+      '⚠️ **Go to rehab before tomorrow 4pm!**',
+      `**Deadline:** ${discordTimestamp(tomorrowTimestamp, 'R')} (${discordTimestamp(tomorrowTimestamp, 't')})`,
+      '',
+      '🔗 [Rehab](https://www.torn.com/city.php#rehab)',
+    ].join('\n'))
+    .setTimestamp();
+}
+
+function racingJoinReminder() {
+  return new EmbedBuilder()
+    .setColor(COLORS.info)
+    .setTitle('🏎️ Racing Reminder')
+    .setDescription([
+      'You are not currently in a race.',
+      '',
+      '🔗 [Join a Race](https://www.torn.com/loader.php?sid=racing)',
     ].join('\n'))
     .setTimestamp();
 }
@@ -648,6 +701,8 @@ module.exports = {
   barFull,
   cooldownReady,
   chainAlert,
+  addictionRehabAlert,
+  racingJoinReminder,
   
   // Notifications - Faction
   factionMemberChange,

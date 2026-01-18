@@ -116,6 +116,49 @@ class TornAPI {
   }
 
   // ─────────────────────────────────────────────────────────────
+  // Company Endpoints
+  // ─────────────────────────────────────────────────────────────
+
+  async getCompanyEmployees() {
+    const { data } = await this.v1.get('/company/', {
+      params: { selections: 'employees' },
+    });
+    
+    if (!data?.company_employees) {
+      throw new Error('Invalid company employees response');
+    }
+    
+    return data.company_employees;
+  }
+
+  async getOwnerId() {
+    const { data } = await this.v1.get('/user/', {
+      params: { selections: 'basic' },
+    });
+    return data.player_id;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Racing Endpoints
+  // ─────────────────────────────────────────────────────────────
+
+  async getRacingLog() {
+    const logIds = '8711,8715,8720,8721,8722,8730,8731';
+    const { data } = await this.v1.get('/user/', {
+      params: { 
+        selections: 'log',
+        log: logIds,
+      },
+    });
+    
+    if (!data?.log) {
+      throw new Error('Invalid racing log response');
+    }
+    
+    return data.log;
+  }
+
+  // ─────────────────────────────────────────────────────────────
   // Utility
   // ─────────────────────────────────────────────────────────────
 
