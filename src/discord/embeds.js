@@ -509,7 +509,7 @@ function refillReminder() {
     .setDescription([
       "You haven't used your **daily energy refill** yet!",
       '',
-      `⏰ Resets ${discordTimestamp(midnightTs, 'R')} at ${discordTimestamp(midnightTs, 't')} Torn time`,
+      `⏰ Resets ${discordTimestamp(midnightTs, 'R')} at ${discordTimestamp(midnightTs, 't')}`,
       '',
       `🔗 [Use Refill Now](${LINKS.pointsBuilding})`,
     ].join('\n'))
