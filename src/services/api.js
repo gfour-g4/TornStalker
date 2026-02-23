@@ -92,21 +92,17 @@ class TornAPI {
   }
 
   /**
-   * Get personal refill stat.
-   * @param {number|null} timestamp - Unix timestamp to query historical value. Omit for current.
-   * @returns {{ name: string, value: number, timestamp: number }}
+   * Get today's refill usage.
+   * @returns {{ energy: boolean, nerve: boolean, token: boolean, special_count: number }}
    */
-  async getRefillStats(timestamp = null) {
-    const params = { stat: 'refills' };
-    if (timestamp != null) params.timestamp = timestamp;
+  async getRefills() {
+    const { data } = await this.v2.get('/user/refills');
     
-    const { data } = await this.v2.get('/user/personalstats', { params });
-    
-    if (!data?.personalstats?.length) {
-      throw new Error('Invalid refill stats response');
+    if (!data?.refills) {
+      throw new Error('Invalid refills response');
     }
     
-    return data.personalstats[0]; // { name, value, timestamp }
+    return data.refills; // { energy, nerve, token, special_count }
   }
 
   // ─────────────────────────────────────────────────────────────

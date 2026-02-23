@@ -281,27 +281,13 @@ async function runRefillCheck() {
   console.log('[refill] Checking energy refill usage...');
 
   try {
-    // yesterday 23:59:59 UTC = start of today UTC minus 1 second
-    const now = new Date();
-    const startOfToday = Date.UTC(
-      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
-      0, 0, 0
-    );
-    const yesterdayEndTs = Math.floor(startOfToday / 1000) - 1;
+    const refills = await api.getRefills();
 
-    // Fetch in parallel: historical snapshot and current value
-    const [yesterday, current] = await Promise.all([
-      api.getRefillStats(yesterdayEndTs),
-      api.getRefillStats(),
-    ]);
-
-    const usedToday = current.value > yesterday.value;
-
-    if (!usedToday) {
+    if (!refills.energy) {
       await notify(Embeds.refillReminder());
-      console.log(`[refill] Reminder sent — yesterday: ${yesterday.value}, now: ${current.value}`);
+      console.log('[refill] Reminder sent — energy refill not yet used today');
     } else {
-      console.log(`[refill] Already used today — yesterday: ${yesterday.value}, now: ${current.value}`);
+      console.log('[refill] Energy refill already used today, skipping');
     }
   } catch (error) {
     console.warn('[refill]', error.message);
