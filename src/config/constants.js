@@ -81,6 +81,7 @@ const LINKS = {
   gym: 'https://www.torn.com/gym.php',
   crimes: 'https://www.torn.com/crimes.php',
   home: 'https://www.torn.com/index.php',
+  pointsBuilding: 'https://www.torn.com/page.php?sid=points',
   
   // Dynamic
   profile: (id) => `https://www.torn.com/profiles.php?XID=${id}`,

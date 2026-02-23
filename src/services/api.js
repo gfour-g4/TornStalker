@@ -91,6 +91,24 @@ class TornAPI {
     return data?.chain || null;
   }
 
+  /**
+   * Get personal refill stat.
+   * @param {number|null} timestamp - Unix timestamp to query historical value. Omit for current.
+   * @returns {{ name: string, value: number, timestamp: number }}
+   */
+  async getRefillStats(timestamp = null) {
+    const params = { stat: 'refills' };
+    if (timestamp != null) params.timestamp = timestamp;
+    
+    const { data } = await this.v2.get('/user/personalstats', { params });
+    
+    if (!data?.personalstats?.length) {
+      throw new Error('Invalid refill stats response');
+    }
+    
+    return data.personalstats[0]; // { name, value, timestamp }
+  }
+
   // ─────────────────────────────────────────────────────────────
   // Faction Endpoints
   // ─────────────────────────────────────────────────────────────

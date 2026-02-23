@@ -310,6 +310,12 @@ function alertsConfig() {
     ? `${EMOJI.on} **Enabled**\n┗ Reminds you to join a race when not in one`
     : `${EMOJI.off} **Disabled**`;
   
+  // Refill reminder config
+  const refill = self.refill || {};
+  const refillLine = refill.enabled
+    ? `${EMOJI.on} **Enabled**\n┗ Alerts at 22:00, 23:00, 23:15, 23:30, 23:45, 23:50, 23:55 Torn time`
+    : `${EMOJI.off} **Disabled**`;
+  
   return new EmbedBuilder()
     .setColor(COLORS.brand)
     .setTitle('🔔 Personal Alerts')
@@ -320,6 +326,7 @@ function alertsConfig() {
       { name: '⛓️ Chain Alerts', value: chainLine, inline: false },
       { name: '⚠️ Addiction Daily Check', value: addictionLine, inline: false },
       { name: '🏎️ Racing Reminders', value: racingLine, inline: false },
+      { name: '⚡ Energy Refill Reminder', value: refillLine, inline: false },
     )
     .setFooter({ text: 'Toggle with buttons below' })
     .setTimestamp();
@@ -483,6 +490,28 @@ function racingJoinReminder() {
       'You are not currently in a race.',
       '',
       '🔗 [Join a Race](https://www.torn.com/loader.php?sid=racing)',
+    ].join('\n'))
+    .setTimestamp();
+}
+
+function refillReminder() {
+  // Show when the Torn day resets (midnight UTC)
+  const now = new Date();
+  const midnight = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1,
+    0, 0, 0
+  ));
+  const midnightTs = Math.floor(midnight.getTime() / 1000);
+
+  return new EmbedBuilder()
+    .setColor(COLORS.warn)
+    .setTitle('⚡ Energy Refill Reminder!')
+    .setDescription([
+      "You haven't used your **daily energy refill** yet!",
+      '',
+      `⏰ Resets ${discordTimestamp(midnightTs, 'R')} at ${discordTimestamp(midnightTs, 't')} Torn time`,
+      '',
+      `🔗 [Use Refill Now](${LINKS.pointsBuilding})`,
     ].join('\n'))
     .setTimestamp();
 }
@@ -703,6 +732,7 @@ module.exports = {
   chainAlert,
   addictionRehabAlert,
   racingJoinReminder,
+  refillReminder,
   
   // Notifications - Faction
   factionMemberChange,

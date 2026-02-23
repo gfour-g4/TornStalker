@@ -2,7 +2,7 @@ const config = require('../config');
 const store = require('../services/store');
 const { pollUser } = require('./user');
 const { pollFaction } = require('./faction');
-const { startSelfPollers, stopSelfPollers } = require('./self');
+const { startSelfPollers, stopSelfPollers, scheduleRefillReminder, cancelRefillReminder } = require('./self');
 
 // ═══════════════════════════════════════════════════════════════
 // POLLER CLASS
@@ -87,14 +87,18 @@ function startPollers() {
   factionPoller.refresh(factionIds);
   factionPoller.start(store.factions.requestMs, pollFaction);
   
-  // Self polling (bars, cooldowns, chain)
+  // Self polling (bars, cooldowns, chain, racing)
   startSelfPollers();
+  
+  // Refill reminder (reschedule in case toggle changed)
+  scheduleRefillReminder();
 }
 
 function stopPollers() {
   userPoller.stop();
   factionPoller.stop();
   stopSelfPollers();
+  cancelRefillReminder();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -260,4 +264,6 @@ module.exports = {
   stopPollers,
   scheduleDailyDigest,
   scheduleAddictionCheck,
+  scheduleRefillReminder,
+  cancelRefillReminder,
 };

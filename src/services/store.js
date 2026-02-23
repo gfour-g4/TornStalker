@@ -78,6 +78,9 @@ class Store {
         lastRaceJoin: null,
         lastNotify: null,
       },
+      refill: {
+        enabled: false,
+      },
     };
   }
 
@@ -123,6 +126,10 @@ class Store {
           racing: {
             ...this._selfDefaults().racing,
             ...loaded.self?.racing,
+          },
+          refill: {
+            ...this._selfDefaults().refill,
+            ...loaded.self?.refill,
           },
         },
         factions: {
@@ -260,16 +267,10 @@ class Store {
           0
         ),
       },
-      alerts: {
-        bars: BARS.filter(b => this.self.bars[b]).length,
-        cooldowns: COOLDOWNS.filter(c => this.self.cooldowns[c]).length,
-        chain: this.self.chain.enabled,
-      },
     };
   }
 }
 
-// Singleton instance
-const store = new Store(path.resolve(config.persist));
+const store = new Store(config.persist);
 
 module.exports = store;

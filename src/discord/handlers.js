@@ -385,6 +385,21 @@ async function handleButton(i) {
         });
       }
       
+      case 'refill': {
+        if (!store.self.refill) store.self.refill = { enabled: false };
+        store.self.refill.enabled = !store.self.refill.enabled;
+        store.save('toggle-refill');
+        
+        // Reschedule (or cancel) the refill reminder
+        const { scheduleRefillReminder } = require('../pollers');
+        scheduleRefillReminder();
+        
+        return i.editReply({
+          embeds: [Embeds.alertsConfig()],
+          components: Components.alertsButtons(),
+        });
+      }
+      
       case 'user': {
         const cfg = store.watchers[id];
         if (cfg) {
