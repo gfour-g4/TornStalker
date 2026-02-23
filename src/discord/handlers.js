@@ -1,5 +1,3 @@
-File: src/discord/handlers.js
-----------------------------------------
 const config = require('../config');
 const store = require('../services/store');
 const api = require('../services/api');
