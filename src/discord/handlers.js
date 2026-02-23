@@ -1,3 +1,5 @@
+File: src/discord/handlers.js
+----------------------------------------
 const config = require('../config');
 const store = require('../services/store');
 const api = require('../services/api');
@@ -386,8 +388,9 @@ async function handleButton(i) {
       }
       
       case 'refill': {
-        if (!store.self.refill) store.self.refill = { enabled: false };
-        store.self.refill.enabled = !store.self.refill.enabled;
+        // id = 'energy' | 'nerve' | 'token'
+        if (!store.self.refill) store.self.refill = { energy: false, nerve: false, token: false };
+        store.self.refill[id] = !store.self.refill[id];
         store.save('toggle-refill');
         
         // Reschedule (or cancel) the refill reminder
@@ -797,3 +800,6 @@ module.exports = {
   handleInteraction,
   setPollerStarter,
 };
+
+
+

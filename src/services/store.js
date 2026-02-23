@@ -79,7 +79,9 @@ class Store {
         lastNotify: null,
       },
       refill: {
-        enabled: false,
+        energy: false,
+        nerve: false,
+        token: false,
       },
     };
   }

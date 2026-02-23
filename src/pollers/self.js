@@ -242,7 +242,10 @@ function cancelRefillReminder() {
 function scheduleRefillReminder() {
   cancelRefillReminder();
 
-  if (!store.self.refill?.enabled) return;
+  // Run if any refill type is enabled
+  const refill = store.self.refill || {};
+  const anyEnabled = refill.energy || refill.nerve || refill.token;
+  if (!anyEnabled) return;
 
   const now = new Date();
 
@@ -273,21 +276,34 @@ function scheduleRefillReminder() {
 async function runRefillCheck() {
   refillTimer = null;
 
-  if (!store.self.refill?.enabled) {
+  const refill = store.self.refill || {};
+  const anyEnabled = refill.energy || refill.nerve || refill.token;
+
+  if (!anyEnabled) {
     scheduleRefillReminder();
     return;
   }
 
-  console.log('[refill] Checking energy refill usage...');
+  console.log('[refill] Checking refill usage...');
 
   try {
-    const refills = await api.getRefills();
+    const data = await api.getRefills();
 
-    if (!refills.energy) {
-      await notify(Embeds.refillReminder());
-      console.log('[refill] Reminder sent — energy refill not yet used today');
-    } else {
-      console.log('[refill] Energy refill already used today, skipping');
+    const types = [
+      { key: 'energy', label: 'Energy', used: data.energy },
+      { key: 'nerve',  label: 'Nerve',  used: data.nerve  },
+      { key: 'token',  label: 'Token',  used: data.token  },
+    ];
+
+    for (const { key, label, used } of types) {
+      if (!refill[key]) continue; // not monitoring this type
+
+      if (!used) {
+        await notify(Embeds.refillReminder(key, label));
+        console.log(`[refill] ${label} reminder sent`);
+      } else {
+        console.log(`[refill] ${label} refill already used today`);
+      }
     }
   } catch (error) {
     console.warn('[refill]', error.message);

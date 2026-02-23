@@ -312,9 +312,15 @@ function alertsConfig() {
   
   // Refill reminder config
   const refill = self.refill || {};
-  const refillLine = refill.enabled
-    ? `${EMOJI.on} **Enabled**\n┗ Alerts at 22:00, 23:00, 23:15, 23:30, 23:45, 23:50, 23:55 Torn time`
-    : `${EMOJI.off} **Disabled**`;
+  const refillTypes = [
+    { key: 'energy', label: 'Energy', emoji: '⚡' },
+    { key: 'nerve',  label: 'Nerve',  emoji: '💢' },
+    { key: 'token',  label: 'Token',  emoji: '🎟️' },
+  ];
+  const anyRefill = refillTypes.some(t => refill[t.key]);
+  const refillLine = refillTypes
+    .map(({ key, label, emoji }) => `${emoji} **${label}:** ${refill[key] ? EMOJI.on : EMOJI.off}`)
+    .join('\n') + (anyRefill ? `\n┗ Alerts at 22:00, 23:00, 23:15, 23:30, 23:45, 23:50, 23:55 Torn time` : '');
   
   return new EmbedBuilder()
     .setColor(COLORS.brand)
@@ -326,7 +332,7 @@ function alertsConfig() {
       { name: '⛓️ Chain Alerts', value: chainLine, inline: false },
       { name: '⚠️ Addiction Daily Check', value: addictionLine, inline: false },
       { name: '🏎️ Racing Reminders', value: racingLine, inline: false },
-      { name: '⚡ Energy Refill Reminder', value: refillLine, inline: false },
+      { name: '🔄 Refill Reminders', value: refillLine, inline: false },
     )
     .setFooter({ text: 'Toggle with buttons below' })
     .setTimestamp();
@@ -494,7 +500,10 @@ function racingJoinReminder() {
     .setTimestamp();
 }
 
-function refillReminder() {
+function refillReminder(type = 'energy', label = 'Energy') {
+  const emojis = { energy: '⚡', nerve: '💢', token: '🎟️' };
+  const emoji = emojis[type] || '🔄';
+
   // Show when the Torn day resets (midnight UTC)
   const now = new Date();
   const midnight = new Date(Date.UTC(
@@ -505,11 +514,11 @@ function refillReminder() {
 
   return new EmbedBuilder()
     .setColor(COLORS.warn)
-    .setTitle('⚡ Energy Refill Reminder!')
+    .setTitle(`${emoji} ${label} Refill Reminder!`)
     .setDescription([
-      "You haven't used your **daily energy refill** yet!",
+      `You haven't used your **daily ${label.toLowerCase()} refill** yet!`,
       '',
-      `⏰ Resets ${discordTimestamp(midnightTs, 'R')} at ${discordTimestamp(midnightTs, 't')}`,
+      `⏰ Resets ${discordTimestamp(midnightTs, 'R')} at ${discordTimestamp(midnightTs, 't')} Torn time`,
       '',
       `🔗 [Use Refill Now](${LINKS.pointsBuilding})`,
     ].join('\n'))

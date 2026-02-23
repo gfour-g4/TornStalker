@@ -182,14 +182,25 @@ function alertsButtons() {
       .setLabel('Racing Reminders')
       .setEmoji('🏎️')
       .setStyle(self.racing.enabled ? ButtonStyle.Success : ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('toggle:refill')
-      .setLabel('Refill Reminder')
-      .setEmoji('⚡')
-      .setStyle((self.refill?.enabled) ? ButtonStyle.Success : ButtonStyle.Secondary),
   );
-  
-  const navRow = new ActionRowBuilder().addComponents(
+
+  const refill = self.refill || {};
+  const refillRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('toggle:refill:energy')
+      .setLabel('Energy Refill')
+      .setEmoji('⚡')
+      .setStyle(refill.energy ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('toggle:refill:nerve')
+      .setLabel('Nerve Refill')
+      .setEmoji('💢')
+      .setStyle(refill.nerve ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('toggle:refill:token')
+      .setLabel('Token Refill')
+      .setEmoji('🎟️')
+      .setStyle(refill.token ? ButtonStyle.Success : ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId('dash:main')
       .setLabel('Back')
@@ -202,7 +213,7 @@ function alertsButtons() {
       .setStyle(ButtonStyle.Primary),
   );
   
-  return [barRow, cdRow, chainRow, addictionRacingRow, navRow];
+  return [barRow, cdRow, chainRow, addictionRacingRow, refillRow];
 }
 
 // ═══════════════════════════════════════════════════════════════
