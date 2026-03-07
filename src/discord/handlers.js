@@ -235,8 +235,11 @@ async function handleModal(i, ephemeral) {
     }
     
     case 'delay': {
-      const time = parseTime(i.fields.getTextInputValue('time')) || 0;
       const cfg = store.watchers[id];
+      if (cfg?.travel?.type === 'private') {
+        return i.editReply({ content: '❌ Private jets can\'t be delayed' });
+      }
+      const time = parseTime(i.fields.getTextInputValue('time')) || 0;
       
       if (cfg?.travel) {
         cfg.travel.earliest = (cfg.travel.earliest || 0) + time;
@@ -778,9 +781,9 @@ async function handleDelayCommand(i) {
   const time = parseTime(i.options.getString('time')) || 0;
   
   const cfg = store.watchers[id];
-  if (!cfg?.travel) {
-    return i.editReply({ content: '❌ User not traveling' });
-  }
+  if (!cfg?.travel) return i.editReply({ content: '❌ User not traveling' });
+  if (cfg.travel.type === 'private') return i.editReply({ content: '❌ Private jets can\'t be delayed' });
+
   
   cfg.travel.earliest = (cfg.travel.earliest || 0) + time;
   cfg.travel.latest = (cfg.travel.latest || 0) + time;

@@ -76,7 +76,10 @@ function parseTravelDirection(description) {
  * Infer travel type from status
  */
 function inferTravelType(status) {
-  return status?.travel_type?.toLowerCase() || 'standard';
+  const plane = status?.plane_image_type?.toLowerCase();
+  if (plane === 'light_aircraft') return 'airstrip';
+  if (plane === 'private_jet') return 'private';
+  return 'standard'; // airliner = standard economy or business
 }
 
 /**
