@@ -154,56 +154,103 @@ function scheduleCooldownPoll(ms) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// RACING POLLING
+// RACING POLLING — Smart XP Race Finder
+//
+// Criteria for a qualifying race:
+//   • track_id === 10  (Docks)
+//   • laps === 100
+//   • participants.maximum === 100
+//   • participants.current >= 50
+//   • status === 'open'
+//   • starts within 30 minutes
+//   • no password, no join fee, no car class, no stock car required
+//
+// Gate conditions (when to send a reminder):
+//   • racing reminders are enabled
+//   • local server hour is between 23:00 and 02:59 (11pm–3am)
+//   • at least 15 minutes since the last reminder was sent
 // ═══════════════════════════════════════════════════════════════
+
+// Track which race IDs we've already alerted for (reset on restart — that's fine)
+const _notifiedRaceIds = new Set();
+
+/**
+ * Returns true if current local hour is in the 11pm–3am window.
+ */
+function _isActiveHour() {
+  const h = new Date().getHours();
+  return h >= 23 || h < 3;
+}
+
+/**
+ * Returns true if the 15-minute cooldown since the last reminder has passed.
+ */
+function _isCooldownOver(racing) {
+  if (!racing.lastNotify) return true;
+  return (Math.floor(Date.now() / 1000) - racing.lastNotify) >= 15 * 60;
+}
+
+/**
+ * Check whether a race from the API matches all XP race criteria.
+ */
+function _qualifies(race) {
+  const now = Math.floor(Date.now() / 1000);
+  const minutesToStart = (race.schedule.start - now) / 60;
+  const req = race.requirements;
+
+  return (
+    race.track_id === 10 &&
+    race.laps === 100 &&
+    race.participants.maximum === 100 &&
+    race.participants.current >= 50 &&
+    race.status === 'open' &&
+    minutesToStart > 0 &&
+    minutesToStart <= 30 &&
+    req.requires_password === false &&
+    req.join_fee === 0 &&
+    req.car_class === null &&
+    req.requires_stock_car === false
+  );
+}
 
 async function pollRacing() {
   const { self } = store.data;
-  
+
   if (!self.racing.enabled) return;
-  
+
+  // ── Gate: time window (11pm–3am local) ──
+  if (!_isActiveHour()) return;
+
+  // ── Gate: 15-minute cooldown between reminders ──
+  if (!_isCooldownOver(self.racing)) return;
+
   try {
-    const log = await api.getRacingLog();
-    const { racing } = store.data.self;
-    
-    const events = Object.values(log);
-    const now = Math.floor(Date.now() / 1000);
-    
-    // 1. Handle no logs (New account or API error)
-    if (events.length === 0) {
-      if ((now - (racing.lastNotify || 0)) > 60 * 60) {
-        await notify(Embeds.racingJoinReminder());
-        racing.lastNotify = now;
-        racing.inRace = false;
-        store.save('racing');
-      }
-      return;
+    const races = await api.getCustomRaces();
+
+    // Filter to qualifying races that haven't been notified yet
+    const qualifying = races
+      .filter(r => _qualifies(r) && !_notifiedRaceIds.has(r.id))
+      .sort((a, b) => b.participants.current - a.participants.current); // most-full first
+
+    if (qualifying.length === 0) return;
+
+    const best = qualifying[0];
+
+    await notify(Embeds.racingXpAlert(best));
+
+    // Update state
+    self.racing.lastNotify = Math.floor(Date.now() / 1000);
+    _notifiedRaceIds.add(best.id);
+
+    // Keep the set from growing unboundedly across a long session
+    if (_notifiedRaceIds.size > 200) {
+      const oldest = [..._notifiedRaceIds].slice(0, 100);
+      oldest.forEach(id => _notifiedRaceIds.delete(id));
     }
-    
-    // 2. Sort by timestamp descending (newest first)
-    events.sort((a, b) => b.timestamp - a.timestamp);
-    const latest = events[0];
-    
-    // 3. Check status based on latest event
-    // Join codes: 8711 (Custom), 8715 (Official)
-    const isRacing = latest.log === 8711 || latest.log === 8715;
-    
-    const prevInRace = racing.inRace;
-    racing.inRace = isRacing;
-    racing.lastChecked = now;
-    
-    // 4. Notify if we need to join a race
-    if (!isRacing) {
-      const lastNotify = racing.lastNotify || 0;
-      
-      if (prevInRace || (now - lastNotify) > 60 * 60) {
-        await notify(Embeds.racingJoinReminder());
-        racing.lastNotify = now;
-        console.log(`[racing] Race finished/idle. Last event: ${latest.title} (${latest.timestamp}). Sent reminder.`);
-      }
-    }
-    
+
     store.save('racing');
+    console.log(`[racing] XP race alert sent — race #${best.id} (${best.participants.current} players)`);
+
   } catch (error) {
     console.warn('[racing]', error.message);
   }
@@ -211,13 +258,6 @@ async function pollRacing() {
 
 // ═══════════════════════════════════════════════════════════════
 // ENERGY REFILL REMINDER
-//
-// Torn day resets at 00:00:00 UTC. We compare the current refill
-// count to the value at yesterday 23:59:59 UTC. If they're equal,
-// the refill hasn't been used today → send a reminder.
-//
-// Reminder schedule (all UTC = Torn time):
-//   22:00, 23:00, 23:15, 23:30, 23:45, 23:50, 23:55
 // ═══════════════════════════════════════════════════════════════
 
 const REFILL_ALERT_TIMES = [
@@ -242,14 +282,12 @@ function cancelRefillReminder() {
 function scheduleRefillReminder() {
   cancelRefillReminder();
 
-  // Run if any refill type is enabled
   const refill = store.self.refill || {};
   const anyEnabled = refill.energy || refill.nerve || refill.token;
   if (!anyEnabled) return;
 
   const now = new Date();
 
-  // Find next upcoming alert slot today (UTC)
   const candidates = REFILL_ALERT_TIMES
     .map(({ h, m }) => new Date(Date.UTC(
       now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), h, m, 0
@@ -260,7 +298,6 @@ function scheduleRefillReminder() {
   if (candidates.length) {
     next = candidates[0];
   } else {
-    // All slots passed today — schedule first slot tomorrow
     const first = REFILL_ALERT_TIMES[0];
     next = new Date(Date.UTC(
       now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1,
@@ -296,7 +333,7 @@ async function runRefillCheck() {
     ];
 
     for (const { key, label, used } of types) {
-      if (!refill[key]) continue; // not monitoring this type
+      if (!refill[key]) continue;
 
       if (!used) {
         await notify(Embeds.refillReminder(key, label));
@@ -309,7 +346,6 @@ async function runRefillCheck() {
     console.warn('[refill]', error.message);
   }
 
-  // Schedule the next slot
   scheduleRefillReminder();
 }
 
@@ -326,29 +362,26 @@ function startSelfPollers() {
   const hasCooldowns = COOLDOWNS.some(c => self.cooldowns[c]);
   const hasRacing = self.racing.enabled;
   
-  // Bars polling
   if (hasBars || hasChain) {
     console.log('[self] Starting bars polling');
     barsTimer = setInterval(pollBars, config.timing.barsMs);
     pollBars();
   }
   
-  // Chain polling (more frequent)
   if (hasChain) {
     console.log('[self] Starting chain polling');
     chainTimer = setInterval(pollChain, config.timing.chainMs);
   }
   
-  // Cooldowns polling (smart scheduling)
   if (hasCooldowns) {
     console.log('[self] Starting cooldowns polling');
     pollCooldowns();
   }
   
-  // Racing polling (check every 5 minutes)
+  // Racing: poll every 2 minutes
   if (hasRacing) {
-    console.log('[self] Starting racing polling');
-    racingTimer = setInterval(pollRacing, 5 * 60 * 1000);
+    console.log('[self] Starting racing polling (XP race finder, every 2min)');
+    racingTimer = setInterval(pollRacing, 2 * 60 * 1000);
     pollRacing(); // Initial check
   }
 }

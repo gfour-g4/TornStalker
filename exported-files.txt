@@ -1,7 +1,7 @@
 ================================================================================
 EXPORTED FILES FOR AI CHATBOT
-Export Date: 3/7/2026, 12:57:54 AM
-Total Files: 22
+Export Date: 3/10/2026, 12:14:57 AM
+Total Files: 23
 ================================================================================
 
 File: index.js
@@ -3438,8 +3438,11 @@ async function handleModal(i, ephemeral) {
     }
     
     case 'delay': {
-      const time = parseTime(i.fields.getTextInputValue('time')) || 0;
       const cfg = store.watchers[id];
+      if (cfg?.travel?.type === 'private') {
+        return i.editReply({ content: '❌ Private jets can\'t be delayed' });
+      }
+      const time = parseTime(i.fields.getTextInputValue('time')) || 0;
       
       if (cfg?.travel) {
         cfg.travel.earliest = (cfg.travel.earliest || 0) + time;
@@ -3981,9 +3984,9 @@ async function handleDelayCommand(i) {
   const time = parseTime(i.options.getString('time')) || 0;
   
   const cfg = store.watchers[id];
-  if (!cfg?.travel) {
-    return i.editReply({ content: '❌ User not traveling' });
-  }
+  if (!cfg?.travel) return i.editReply({ content: '❌ User not traveling' });
+  if (cfg.travel.type === 'private') return i.editReply({ content: '❌ Private jets can\'t be delayed' });
+
   
   cfg.travel.earliest = (cfg.travel.earliest || 0) + time;
   cfg.travel.latest = (cfg.travel.latest || 0) + time;
@@ -6501,7 +6504,10 @@ function parseTravelDirection(description) {
  * Infer travel type from status
  */
 function inferTravelType(status) {
-  return status?.travel_type?.toLowerCase() || 'standard';
+  const plane = status?.plane_image_type?.toLowerCase();
+  if (plane === 'light_aircraft') return 'airstrip';
+  if (plane === 'private_jet') return 'private';
+  return 'standard'; // airliner = standard economy or business
 }
 
 /**
@@ -6554,5 +6560,31 @@ module.exports = {
   DESTINATIONS,
 };
 
+
+================================================================================
+
+File: .env.example
+----------------------------------------
+DISCORD_TOKEN=your-discord-bot-token
+OWNER_DISCORD_ID=your-discord-user-id
+TORN_API_KEY=your-torn-api-key
+
+# Optional seed list if store.json is empty
+USER_IDS=2796054,436254
+
+# Default states to alert for new watchers (comma-separated, or "all")
+DEFAULT_STATES=Traveling,Jail,Hospital
+
+# Polling interval per-user (ms). One user per tick.
+REQUEST_INTERVAL_MS=5000
+
+# Keepalive for Render
+SELF_PING_URL=https://your-render-service.onrender.com/
+
+# Guild to instantly register commands (optional). Commands also work in DMs.
+GUILD_ID=your-guild-id
+
+# Local JSON persistence file
+PERSIST_PATH=./store.json
 
 ================================================================================

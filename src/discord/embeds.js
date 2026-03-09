@@ -500,6 +500,47 @@ function racingJoinReminder() {
     .setTimestamp();
 }
 
+/**
+ * Rich XP race alert — fired when a qualifying Docks 100-lap race is open.
+ * @param {object} race - Race object from the Torn v2 racing API
+ */
+function racingXpAlert(race) {
+  const title = (race.title || 'Unnamed race').replace(/&#039;/g, "'").replace(/&#39;/g, "'");
+  const raceUrl = `https://www.torn.com/loader.php?sid=racing&tab=race&raceID=${race.id}`;
+
+  const now = Math.floor(Date.now() / 1000);
+  const secsToStart = race.schedule.start - now;
+  const mins = Math.floor(secsToStart / 60);
+  const secs = secsToStart % 60;
+  const timeLeft = `${mins}m ${secs}s`;
+
+  const fillPct = Math.round((race.participants.current / race.participants.maximum) * 100);
+  const barLen = 12;
+  const filled = Math.round((fillPct / 100) * barLen);
+  const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
+
+  return new EmbedBuilder()
+    .setColor(0x1abc9c)
+    .setTitle('🏁 XP Race Alert — Docks 100 Laps!')
+    .setDescription([
+      `**${title}** is filling up fast!`,
+      '',
+      `\`${bar}\` **${race.participants.current}/${race.participants.maximum}** players (${fillPct}%)`,
+      '',
+      `⏳ Starts in **${timeLeft}**`,
+      `🔓 No password • No fee • Any car`,
+      '',
+      `🔗 [Join Race #${race.id}](${raceUrl})`,
+    ].join('\n'))
+    .addFields(
+      { name: '🗺️ Track', value: 'Docks', inline: true },
+      { name: '🔄 Laps', value: String(race.laps), inline: true },
+      { name: '🏁 Starts', value: `<t:${race.schedule.start}:R>`, inline: true },
+    )
+    .setFooter({ text: `Race ID: ${race.id}` })
+    .setTimestamp();
+}
+
 function refillReminder(type = 'energy', label = 'Energy') {
   const emojis = { energy: '⚡', nerve: '💢', token: '🎟️' };
   const emoji = emojis[type] || '🔄';
@@ -741,6 +782,7 @@ module.exports = {
   chainAlert,
   addictionRehabAlert,
   racingJoinReminder,
+  racingXpAlert,
   refillReminder,
   
   // Notifications - Faction

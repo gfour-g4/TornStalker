@@ -172,6 +172,27 @@ class TornAPI {
     return data.log;
   }
 
+    /**
+   * Fetch the latest 100 custom races (sorted DESC).
+   * Used by the XP race reminder to find qualifying open races.
+   * @returns {Array} Array of race objects
+   */
+    async getCustomRaces() {
+      const { data } = await this.v2.get('/racing/races', {
+        params: {
+          limit: 100,
+          sort: 'DESC',
+          cat: 'custom',
+        },
+      });
+  
+      if (!data?.races) {
+        throw new Error('Invalid custom races response');
+      }
+  
+      return data.races;
+    }
+
   // ─────────────────────────────────────────────────────────────
   // Utility
   // ─────────────────────────────────────────────────────────────
